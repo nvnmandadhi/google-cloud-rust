@@ -515,6 +515,10 @@ where
         let token = self.token_provider.token(extensions).await?;
         build_cacheable_headers(&token, &self.quota_project_id)
     }
+
+    async fn access_token(&self) -> Result<CacheableResource<Token>> {
+        Ok(self.token_provider.token(Extensions::new()).await?)
+    }
 }
 
 struct ImpersonatedTokenProvider {
@@ -1106,6 +1110,10 @@ mod tests {
                 &self,
                 _extensions: Extensions,
             ) -> Result<CacheableResource<HeaderMap>> {
+                Err(errors::non_retryable_from_str("source failed"))
+            }
+
+            async fn access_token(&self) -> Result<CacheableResource<Token>> {
                 Err(errors::non_retryable_from_str("source failed"))
             }
         }

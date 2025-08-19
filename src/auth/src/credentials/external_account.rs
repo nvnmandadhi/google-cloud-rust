@@ -1257,6 +1257,10 @@ where
         let token = self.token_provider.token(extensions).await?;
         build_cacheable_headers(&token, &self.quota_project_id)
     }
+
+    async fn access_token(&self) -> Result<CacheableResource<Token>> {
+        Ok(self.token_provider.token(Extensions::new()).await?)
+    }
 }
 
 #[cfg(test)]

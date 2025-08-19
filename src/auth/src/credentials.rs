@@ -15,6 +15,7 @@
 use crate::build_errors::Error as BuilderError;
 use crate::constants::GOOGLE_CLOUD_QUOTA_PROJECT_VAR;
 use crate::errors::{self, CredentialsError};
+use crate::token::Token;
 use crate::{BuildResult, Result};
 use http::{Extensions, HeaderMap};
 use serde_json::Value;
@@ -130,6 +131,10 @@ impl Credentials {
     pub async fn universe_domain(&self) -> Option<String> {
         self.inner.universe_domain().await
     }
+
+    pub async fn access_token(&self) -> Result<CacheableResource<Token>> {
+        self.inner.access_token().await
+    }
 }
 
 /// Represents a [Credentials] used to obtain auth request headers.
@@ -200,9 +205,14 @@ pub trait CredentialsProvider: std::fmt::Debug {
 
     /// Retrieves the universe domain associated with the credentials, if any.
     fn universe_domain(&self) -> impl Future<Output = Option<String>> + Send;
+
+    /// Retrieves the access_token from `headers`
+    fn access_token(&self) -> impl Future<Output = Result<CacheableResource<Token>>> + Send;
 }
 
 pub(crate) mod dynamic {
+    use crate::token::Token;
+
     use super::Result;
     use super::{CacheableResource, Extensions, HeaderMap};
 
@@ -236,6 +246,8 @@ pub(crate) mod dynamic {
         async fn universe_domain(&self) -> Option<String> {
             Some("googleapis.com".to_string())
         }
+
+        async fn access_token(&self) -> Result<CacheableResource<Token>>;
     }
 
     /// The public CredentialsProvider implements the dyn-compatible CredentialsProvider.
@@ -249,6 +261,9 @@ pub(crate) mod dynamic {
         }
         async fn universe_domain(&self) -> Option<String> {
             T::universe_domain(self).await
+        }
+        async fn access_token(&self) -> Result<CacheableResource<Token>> {
+            T::access_token(self).await
         }
     }
 }
@@ -577,6 +592,7 @@ pub mod testing {
     use crate::Result;
     use crate::credentials::Credentials;
     use crate::credentials::dynamic::CredentialsProvider;
+    use crate::token::Token;
     use http::{Extensions, HeaderMap};
     use std::sync::Arc;
 
@@ -604,6 +620,20 @@ pub mod testing {
         async fn universe_domain(&self) -> Option<String> {
             None
         }
+
+        async fn access_token(&self) -> Result<CacheableResource<Token>> {
+            let expires_at =
+                tokio::time::Instant::now() + tokio::time::Duration::from_secs(60 * 60);
+            Ok(CacheableResource::New {
+                entity_tag: Default::default(),
+                data: Token {
+                    token: "test-access-token".into(),
+                    token_type: "Bearer".into(),
+                    expires_at: Some(expires_at),
+                    metadata: None,
+                },
+            })
+        }
     }
 
     /// A simple credentials implementation to use in tests.
@@ -626,6 +656,10 @@ pub mod testing {
 
         async fn universe_domain(&self) -> Option<String> {
             None
+        }
+
+        async fn access_token(&self) -> Result<CacheableResource<Token>> {
+            Err(super::CredentialsError::from_msg(self.0, "test-only"))
         }
     }
 }

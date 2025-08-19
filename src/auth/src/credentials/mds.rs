@@ -329,6 +329,10 @@ where
         }
         return Some(DEFAULT_UNIVERSE_DOMAIN.to_string());
     }
+
+    async fn access_token(&self) -> Result<CacheableResource<Token>> {
+        Ok(self.token_provider.token(Extensions::new()).await?)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
