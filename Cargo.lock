@@ -7991,6 +7991,7 @@ dependencies = [
  "google-cloud-aiplatform-v1",
  "google-cloud-auth",
  "google-cloud-compute-v1",
+ "google-cloud-auth",
  "google-cloud-gax",
  "google-cloud-iam-v1",
  "google-cloud-language-v2",
