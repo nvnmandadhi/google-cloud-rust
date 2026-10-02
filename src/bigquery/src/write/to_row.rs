@@ -32,6 +32,8 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 ///
 /// - `String`, for `STRING` columns.
 /// - `i64`, for `INT64` columns.
+/// - [`Timestamp`](wkt::Timestamp), for `TIMESTAMP` columns. BigQuery keeps
+///   microseconds, so any nanoseconds are rounded down.
 ///
 /// # Example
 ///
@@ -110,6 +112,35 @@ impl ProtoValue for i64 {
     }
 }
 
+impl ProtoValue for wkt::Timestamp {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // BigQuery takes `TIMESTAMP` values as microseconds since the Unix
+        // epoch, in an `int64` field.
+        int64_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_int64(number, timestamp_micros(self), buf);
+        Ok(())
+    }
+}
+
+/// The number of microseconds in a second.
+const MICROS_PER_SECOND: i64 = 1_000_000;
+
+/// The number of nanoseconds in a microsecond.
+const NANOS_PER_MICRO: i32 = 1_000;
+
+/// Returns the microseconds since the Unix epoch, rounded down.
+///
+/// The nanoseconds in a [wkt::Timestamp] are never negative, even before the
+/// epoch, so dividing them rounds down. The result cannot overflow: a
+/// [wkt::Timestamp] is between the years 1 and 9999, like a BigQuery
+/// `TIMESTAMP`.
+fn timestamp_micros(timestamp: &wkt::Timestamp) -> i64 {
+    timestamp.seconds() * MICROS_PER_SECOND + i64::from(timestamp.nanos() / NANOS_PER_MICRO)
+}
+
 /// Returns the schema for a message with the given name and fields.
 ///
 /// This is an implementation detail of [ToRow], it is not part of the public
@@ -124,10 +155,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::timestamp_micros;
     use crate::google::cloud::bigquery::storage::v1;
     use crate::write::ToRow;
     use gaxi::prost::ToProto;
     use prost::Message;
+    use test_case::test_case;
+    use wkt::Timestamp;
 
     // Generated code runs in the application's crate, so it names everything
     // through `google_cloud_bigquery::...` paths. This makes those paths work
@@ -159,29 +193,55 @@ mod tests {
     /// skips zeros, and then there would be nothing to compare.
     const COUNT: i64 = 42;
 
-    /// A row with a `STRING` and an `INT64` column.
+    /// The name of the third column in our row.
+    const CREATED_AT_COLUMN: &str = "created_at";
+
+    /// The field number of the `created_at` column.
+    const CREATED_AT_FIELD: u32 = 3;
+
+    /// A sample value for the `created_at` column, with nanoseconds.
+    const CREATED_AT: &str = "2025-05-16T09:46:12.123456789Z";
+
+    /// `CREATED_AT` in microseconds since the Unix epoch. The last three
+    /// digits of the nanoseconds are dropped.
+    const CREATED_AT_MICROS: i64 = 1_747_388_772_123_456;
+
+    /// The earliest BigQuery `TIMESTAMP`, 0001-01-01 00:00:00 UTC, in
+    /// microseconds since the Unix epoch.
+    const MIN_MICROS: i64 = -62_135_596_800_000_000;
+
+    /// The latest BigQuery `TIMESTAMP`, 9999-12-31 23:59:59.999999 UTC, in
+    /// microseconds since the Unix epoch.
+    const MAX_MICROS: i64 = 253_402_300_799_999_999;
+
+    /// A row with a `STRING`, an `INT64`, and a `TIMESTAMP` column.
     #[derive(ToRow)]
     struct Row {
         name: String,
         count: i64,
+        created_at: Timestamp,
     }
 
     /// What `prost` generates for
-    /// `message Row { string name = 1; int64 count = 2; }`.
+    /// `message Row { string name = 1; int64 count = 2; int64 created_at = 3; }`.
     #[derive(Clone, PartialEq, Message)]
     struct ProstRow {
         #[prost(string, tag = "1")]
         name: String,
         #[prost(int64, tag = "2")]
         count: i64,
+        /// BigQuery takes `TIMESTAMP` values as microseconds since the epoch.
+        #[prost(int64, tag = "3")]
+        created_at: i64,
     }
 
     /// A row with the sample values.
-    fn sample_row() -> Row {
-        Row {
+    fn sample_row() -> anyhow::Result<Row> {
+        Ok(Row {
             name: NAME.to_string(),
             count: COUNT,
-        }
+            created_at: Timestamp::try_from(CREATED_AT)?,
+        })
     }
 
     /// The bytes `prost` writes for `sample_row()`.
@@ -189,6 +249,7 @@ mod tests {
         ProstRow {
             name: NAME.to_string(),
             count: COUNT,
+            created_at: CREATED_AT_MICROS,
         }
         .encode_to_vec()
     }
@@ -201,6 +262,7 @@ mod tests {
             field: vec![
                 sent_field(NAME_COLUMN, NAME_FIELD, Type::String)?,
                 sent_field(COUNT_COLUMN, COUNT_FIELD, Type::Int64)?,
+                sent_field(CREATED_AT_COLUMN, CREATED_AT_FIELD, Type::Int64)?,
             ],
             ..Default::default()
         })
@@ -232,7 +294,7 @@ mod tests {
 
     #[test]
     fn to_row_matches_prost() -> anyhow::Result<()> {
-        assert_eq!(sample_row().to_row()?, sample_row_bytes());
+        assert_eq!(sample_row()?.to_row()?, sample_row_bytes());
         Ok(())
     }
 
@@ -241,15 +303,37 @@ mod tests {
         let row = Row {
             name: String::new(),
             count: 0,
+            created_at: Timestamp::default(),
         };
         let want = [
             0x0A, 0x00, // name: tag (field 1, length-delimited), length 0
             0x10, 0x00, // count: tag (field 2, varint), value 0
+            0x18, 0x00, // created_at: tag (field 3, varint), the epoch is 0
         ];
         assert_eq!(row.to_row()?, want.as_slice());
         // `prost` skips default values, which BigQuery would read as NULLs.
         let encoded = ProstRow::default().encode_to_vec();
         assert!(encoded.is_empty(), "{encoded:?}");
+        Ok(())
+    }
+
+    #[test_case(0, 0, 0; "epoch")]
+    #[test_case(1, 1_999, 1_000_001; "drops the last nanosecond digits")]
+    #[test_case(-1, 999_999_500, -1; "rounds down before the epoch")]
+    fn timestamp_micros_rounds_down(seconds: i64, nanos: i32, want: i64) -> anyhow::Result<()> {
+        let timestamp = Timestamp::new(seconds, nanos)?;
+        assert_eq!(timestamp_micros(&timestamp), want);
+        Ok(())
+    }
+
+    #[test]
+    fn timestamp_micros_does_not_overflow() -> anyhow::Result<()> {
+        // The earliest and latest `wkt::Timestamp` values are also the earliest
+        // and latest BigQuery `TIMESTAMP` values.
+        let min = Timestamp::new(Timestamp::MIN_SECONDS, Timestamp::MIN_NANOS)?;
+        assert_eq!(timestamp_micros(&min), MIN_MICROS);
+        let max = Timestamp::new(Timestamp::MAX_SECONDS, Timestamp::MAX_NANOS)?;
+        assert_eq!(timestamp_micros(&max), MAX_MICROS);
         Ok(())
     }
 
@@ -286,7 +370,7 @@ mod tests {
             .open_default_stream(TABLE)
             .build_proto(Row::schema())
             .await?;
-        let rows = ProtoRows::new().set_serialized_rows([sample_row().to_row()?]);
+        let rows = ProtoRows::new().set_serialized_rows([sample_row()?.to_row()?]);
 
         // Appends to the default stream succeed without an offset.
         let success = mock_v1::AppendRowsResponse {
