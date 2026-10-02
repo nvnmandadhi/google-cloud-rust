@@ -24,26 +24,39 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 /// which describes the rows, and the rows themselves, encoded as protocol
 /// buffers. Types that implement this trait provide both.
 ///
-/// BigQuery matches the fields in the schema to the table's columns by name.
+/// Use [`#[derive(ToRow)]`](derive@crate::write::ToRow) to implement this
+/// trait. Each field is written to the column with the same name. Use
+/// `#[bigquery(rename = "column_name")]` when the names differ.
+///
+/// # Supported types
+///
+/// - `String`, for `STRING` columns.
 ///
 /// # Example
 ///
 /// ```
 /// # use google_cloud_bigquery::client::Write;
 /// # use google_cloud_bigquery::model::ProtoRows;
-/// # use google_cloud_bigquery::write::ToRow;
-/// async fn write_rows<T: ToRow>(client: &Write, table: &str, rows: &[T]) -> anyhow::Result<()> {
-///     let writer = client
-///         .open_default_stream(table)
-///         .build_proto(T::schema())
-///         .await?;
-///     let rows = rows.iter().map(T::to_row).collect::<Result<Vec<_>, _>>()?;
-///     writer
-///         .append(ProtoRows::new().set_serialized_rows(rows))
-///         .send()
-///         .await?;
-///     Ok(())
+/// use google_cloud_bigquery::write::ToRow;
+///
+/// #[derive(ToRow)]
+/// struct Row {
+///     name: String,
 /// }
+///
+/// # async fn sample(client: Write) -> anyhow::Result<()> {
+/// let writer = client
+///     .open_default_stream("projects/my-project/datasets/my_dataset/tables/my_table")
+///     .build_proto(Row::schema())
+///     .await?;
+/// let rows = [Row { name: "alice".to_string() }, Row { name: "bob".to_string() }];
+/// let serialized_rows = rows.iter().map(Row::to_row).collect::<Result<Vec<_>, _>>()?;
+/// writer
+///     .append(ProtoRows::new().set_serialized_rows(serialized_rows))
+///     .send()
+///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 ///
 /// [Proto]: crate::write::format::Proto
@@ -99,8 +112,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::google::cloud::bigquery::storage::v1;
+    use crate::write::ToRow;
     use gaxi::prost::ToProto;
     use prost::Message;
 
@@ -125,38 +138,9 @@ mod tests {
     const NAME: &str = "alice";
 
     /// A row with one `STRING` column.
+    #[derive(ToRow)]
     struct Row {
         name: String,
-    }
-
-    // What `#[derive(ToRow)]` will generate for `Row`. The macro writes the
-    // values of `ROW`, `NAME_COLUMN`, and `NAME_FIELD` instead of the
-    // constants.
-    impl google_cloud_bigquery::write::ToRow for Row {
-        fn schema() -> google_cloud_bigquery::model::ProtoSchema {
-            google_cloud_bigquery::write::__private::message_schema(
-                ROW,
-                [
-                    <String as google_cloud_bigquery::write::__private::ProtoValue>::field_descriptor(
-                        NAME_COLUMN,
-                        NAME_FIELD,
-                    ),
-                ],
-            )
-        }
-
-        fn to_row(
-            &self,
-        ) -> std::result::Result<
-            google_cloud_bigquery::write::__private::Bytes,
-            google_cloud_bigquery::error::ConvertError,
-        > {
-            let mut buf = std::vec::Vec::new();
-            google_cloud_bigquery::write::__private::ProtoValue::encode(
-                &self.name, NAME_FIELD, &mut buf,
-            )?;
-            std::result::Result::Ok(buf.into())
-        }
     }
 
     /// What `prost` generates for `message Row { string name = 1; }`.

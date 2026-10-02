@@ -19,6 +19,7 @@ pub use committed::CommittedWriter;
 pub use default::DefaultWriter;
 pub use pending::PendingWriter;
 
+pub use google_cloud_bigquery_derive::ToRow;
 pub use to_row::ToRow;
 
 /// Defines the data formats accepted by a writer.
@@ -29,7 +30,7 @@ pub mod retry_policy;
 
 pub mod stream_type;
 
-/// Helpers for implementing `ToRow`.
+/// Helpers for the code that `#[derive(ToRow)]` generates.
 ///
 /// This module is not part of the public API. Its contents may change, or be
 /// removed, in any release.
