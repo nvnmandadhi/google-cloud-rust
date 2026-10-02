@@ -38,19 +38,30 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 /// | `bool` | `BOOL` |
 /// | `i32`, `i64` | `INT64` |
 /// | `f32`, `f64` | `FLOAT64` |
+/// | [`rust_decimal::Decimal`], [`google_cloud_type::model::Decimal`] | `NUMERIC`, `BIGNUMERIC` |
 /// | `String` | `STRING` |
 /// | `Vec<u8>`, [`Bytes`](bytes::Bytes) | `BYTES` |
+/// | [`Date`](google_cloud_type::model::Date) | `DATE` |
+/// | [`DateTime`](google_cloud_type::model::DateTime) | `DATETIME` |
+/// | [`TimeOfDay`](google_cloud_type::model::TimeOfDay) | `TIME` |
 /// | [`Timestamp`](wkt::Timestamp) | `TIMESTAMP` |
+/// | [`Value`](wkt::Value), [`Struct`](wkt::Struct) | `JSON` |
 /// | `Option<T>` | The type for `T`. `None` writes `NULL`. |
 /// | `Vec<T>` | An `ARRAY` of the type for `T`. |
 ///
-/// BigQuery keeps microseconds, so the nanoseconds in a
-/// [`Timestamp`](wkt::Timestamp) are rounded down.
+/// Some types have limits:
 ///
-/// BigQuery arrays cannot contain `NULL` values or other arrays, so the
-/// elements of a `Vec<T>` cannot be `Option` or `Vec` values, except for
-/// `Vec<u8>`, which is a `BYTES` value. Arrays cannot be `NULL` either: `None`
-/// in an `Option<Vec<T>>` writes an empty array.
+/// - BigQuery keeps microseconds, so any nanoseconds are rounded down.
+/// - Dates must have a year, a month, and a day, between the years 1 and
+///   9999. [to_row](ToRow::to_row) returns an error for other dates, and for
+///   times such as `24:00:00` or leap seconds.
+/// - A [`DateTime`](google_cloud_type::model::DateTime) with a time zone or a
+///   UTC offset is an error. Use a [`Timestamp`](wkt::Timestamp) instead.
+/// - `Value::Null` writes the JSON value `null`, not a SQL `NULL`.
+/// - BigQuery arrays cannot contain `NULL` values or other arrays, so the
+///   elements of a `Vec<T>` cannot be `Option` or `Vec` values, except for
+///   `Vec<u8>`, which is a `BYTES` value. Arrays cannot be `NULL` either:
+///   `None` in an `Option<Vec<T>>` writes an empty array.
 ///
 /// # Example
 ///
@@ -255,6 +266,170 @@ fn timestamp_micros(timestamp: &wkt::Timestamp) -> i64 {
     timestamp.seconds() * MICROS_PER_SECOND + i64::from(timestamp.nanos() / NANOS_PER_MICRO)
 }
 
+impl ProtoValue for google_cloud_type::model::Date {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // BigQuery takes `DATE` values as days since the Unix epoch, in an
+        // `int64` field.
+        int64_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        let date = civil_date(self.year, self.month, self.day)?;
+        encode_int64(number, (date - UNIX_EPOCH).whole_days(), buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for google_cloud_type::model::DateTime {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // BigQuery takes `DATETIME` values as strings, such as
+        // "2025-05-16 09:46:12.123456".
+        string_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        if self.time_offset.is_some() {
+            return Err(ConvertError::Convert(
+                "a `DATETIME` has no time zone or UTC offset, use a `Timestamp` instead".into(),
+            ));
+        }
+        let date = civil_date(self.year, self.month, self.day)?;
+        let time = civil_time(self.hours, self.minutes, self.seconds, self.nanos)?;
+        let value = time::PrimitiveDateTime::new(date, time)
+            .format(DATETIME_FORMAT)
+            .map_err(|e| ConvertError::Convert(Box::new(e)))?;
+        encode_string(number, &value, buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for google_cloud_type::model::TimeOfDay {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // BigQuery takes `TIME` values as strings, such as "09:46:12.123456".
+        string_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        let value = civil_time(self.hours, self.minutes, self.seconds, self.nanos)?
+            .format(TIME_FORMAT)
+            .map_err(|e| ConvertError::Convert(Box::new(e)))?;
+        encode_string(number, &value, buf);
+        Ok(())
+    }
+}
+
+/// The first day of the Unix epoch, 1970-01-01.
+const UNIX_EPOCH: time::Date = time::OffsetDateTime::UNIX_EPOCH.date();
+
+/// The earliest year in a BigQuery `DATE` or `DATETIME`.
+const MIN_YEAR: i32 = 1;
+
+/// The latest year in a BigQuery `DATE` or `DATETIME`.
+const MAX_YEAR: i32 = 9999;
+
+/// Formats a `DATETIME` value. BigQuery keeps microseconds, so this drops the
+/// last three digits of the nanoseconds.
+const DATETIME_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
+    "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6]"
+);
+
+/// Formats a `TIME` value. BigQuery keeps microseconds, so this drops the last
+/// three digits of the nanoseconds.
+const TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
+    time::macros::format_description!("[hour]:[minute]:[second].[subsecond digits:6]");
+
+/// Returns the date for a BigQuery `DATE` or `DATETIME` value.
+///
+/// A [Date](google_cloud_type::model::Date) may leave out the year, the
+/// month, or the day, by setting them to 0. BigQuery dates need all three.
+fn civil_date(year: i32, month: i32, day: i32) -> Result<time::Date, ConvertError> {
+    let invalid = || {
+        let date = format!("{year:04}-{month:02}-{day:02}");
+        ConvertError::Convert(format!("{date} is not a valid BigQuery date").into())
+    };
+    if !(MIN_YEAR..=MAX_YEAR).contains(&year) {
+        return Err(invalid());
+    }
+    let month = u8::try_from(month)
+        .ok()
+        .and_then(|month| time::Month::try_from(month).ok())
+        .ok_or_else(invalid)?;
+    let day = u8::try_from(day).map_err(|_| invalid())?;
+    time::Date::from_calendar_date(year, month, day).map_err(|_| invalid())
+}
+
+/// Returns the time of day for a BigQuery `TIME` or `DATETIME` value.
+///
+/// A [TimeOfDay](google_cloud_type::model::TimeOfDay) may allow `24:00:00`,
+/// or leap seconds. BigQuery times do not.
+fn civil_time(
+    hours: i32,
+    minutes: i32,
+    seconds: i32,
+    nanos: i32,
+) -> Result<time::Time, ConvertError> {
+    let invalid = || {
+        let time = format!("{hours:02}:{minutes:02}:{seconds:02}.{nanos:09}");
+        ConvertError::Convert(format!("{time} is not a valid BigQuery time").into())
+    };
+    let hour = u8::try_from(hours).map_err(|_| invalid())?;
+    let minute = u8::try_from(minutes).map_err(|_| invalid())?;
+    let second = u8::try_from(seconds).map_err(|_| invalid())?;
+    let nanosecond = u32::try_from(nanos).map_err(|_| invalid())?;
+    time::Time::from_hms_nano(hour, minute, second, nanosecond).map_err(|_| invalid())
+}
+
+impl ProtoValue for rust_decimal::Decimal {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // BigQuery takes `NUMERIC` and `BIGNUMERIC` values as strings, such as
+        // "123.45". Unlike a `double`, a string keeps every digit.
+        string_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_string(number, &self.to_string(), buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for google_cloud_type::model::Decimal {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // BigQuery takes `NUMERIC` and `BIGNUMERIC` values as strings.
+        string_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        // BigQuery parses the value, like any other `NUMERIC` string.
+        encode_string(number, &self.value, buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for wkt::Value {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // BigQuery takes `JSON` values as strings.
+        string_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_string(number, &self.to_string(), buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for wkt::Struct {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // BigQuery takes `JSON` values as strings.
+        string_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        let value = serde_json::to_string(self).map_err(|e| ConvertError::Convert(Box::new(e)))?;
+        encode_string(number, &value, buf);
+        Ok(())
+    }
+}
+
 impl<T: ProtoValue> ProtoValue for Option<T> {
     fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
         // All fields are optional in the schema, so `NULL` needs no changes.
@@ -281,6 +456,13 @@ impl ProtoElement for f32 {}
 impl ProtoElement for Vec<u8> {}
 impl ProtoElement for Bytes {}
 impl ProtoElement for wkt::Timestamp {}
+impl ProtoElement for google_cloud_type::model::Date {}
+impl ProtoElement for google_cloud_type::model::DateTime {}
+impl ProtoElement for google_cloud_type::model::TimeOfDay {}
+impl ProtoElement for rust_decimal::Decimal {}
+impl ProtoElement for google_cloud_type::model::Decimal {}
+impl ProtoElement for wkt::Value {}
+impl ProtoElement for wkt::Struct {}
 
 impl<T: ProtoElement> ProtoValue for Vec<T> {
     fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
@@ -312,10 +494,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{ProtoValue, timestamp_micros};
+    use crate::error::ConvertError;
     use crate::google::cloud::bigquery::storage::v1;
     use crate::write::ToRow;
     use bytes::Bytes;
     use gaxi::prost::ToProto;
+    use google_cloud_type::model::{Date, DateTime, TimeOfDay, TimeZone};
     use prost::Message;
     use test_case::test_case;
     use wkt::Timestamp;
@@ -566,10 +750,20 @@ mod tests {
         assert_eq!(field_type::<i64>(), Type::Int64);
         assert_eq!(field_type::<f32>(), Type::Float);
         assert_eq!(field_type::<f64>(), Type::Double);
+        assert_eq!(field_type::<rust_decimal::Decimal>(), Type::String);
+        assert_eq!(
+            field_type::<google_cloud_type::model::Decimal>(),
+            Type::String
+        );
         assert_eq!(field_type::<String>(), Type::String);
         assert_eq!(field_type::<Vec<u8>>(), Type::Bytes);
         assert_eq!(field_type::<Bytes>(), Type::Bytes);
+        assert_eq!(field_type::<Date>(), Type::Int64);
+        assert_eq!(field_type::<DateTime>(), Type::String);
+        assert_eq!(field_type::<TimeOfDay>(), Type::String);
         assert_eq!(field_type::<Timestamp>(), Type::Int64);
+        assert_eq!(field_type::<wkt::Value>(), Type::String);
+        assert_eq!(field_type::<wkt::Struct>(), Type::String);
         assert_eq!(field_type::<Option<String>>(), Type::String);
         // An array has the type of its elements.
         assert_eq!(field_type::<Vec<i64>>(), Type::Int64);
@@ -711,6 +905,175 @@ mod tests {
         // `prost` skips default values, which BigQuery would read as NULLs.
         let encoded = ProstScalars::default().encode_to_vec();
         assert!(encoded.is_empty(), "{encoded:?}");
+        Ok(())
+    }
+
+    /// Returns `value` encoded as field 1. The field number does not matter.
+    fn field_bytes<T: ProtoValue>(value: &T) -> Result<Vec<u8>, ConvertError> {
+        let mut buf = Vec::new();
+        value.encode(NAME_FIELD, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Returns a date with the given fields.
+    fn date(year: i32, month: i32, day: i32) -> Date {
+        Date::new().set_year(year).set_month(month).set_day(day)
+    }
+
+    /// Returns a time of day with the given fields.
+    fn time_of_day(hours: i32, minutes: i32, seconds: i32, nanos: i32) -> TimeOfDay {
+        TimeOfDay::new()
+            .set_hours(hours)
+            .set_minutes(minutes)
+            .set_seconds(seconds)
+            .set_nanos(nanos)
+    }
+
+    /// Returns a date and time, without a time zone or a UTC offset.
+    fn datetime(date: Date, time: TimeOfDay) -> DateTime {
+        DateTime::new()
+            .set_year(date.year)
+            .set_month(date.month)
+            .set_day(date.day)
+            .set_hours(time.hours)
+            .set_minutes(time.minutes)
+            .set_seconds(time.seconds)
+            .set_nanos(time.nanos)
+    }
+
+    // The earliest and latest dates are the limits of a BigQuery `DATE`.
+    #[test_case(1970, 1, 1, 0; "epoch")]
+    #[test_case(1969, 12, 31, -1; "before the epoch")]
+    #[test_case(2025, 5, 16, 20_224; "after the epoch")]
+    #[test_case(1, 1, 1, -719_162; "earliest")]
+    #[test_case(9999, 12, 31, 2_932_896; "latest")]
+    fn dates_are_days_since_epoch(
+        year: i32,
+        month: i32,
+        day: i32,
+        days: i64,
+    ) -> anyhow::Result<()> {
+        // A `Date` is written like an `i64` with the days since the epoch.
+        assert_eq!(field_bytes(&date(year, month, day))?, field_bytes(&days)?);
+        Ok(())
+    }
+
+    #[test_case(0, 1, 1; "no year")]
+    #[test_case(10_000, 1, 1; "after 9999")]
+    #[test_case(2025, 0, 1; "no month")]
+    #[test_case(2025, 13, 1; "month 13")]
+    #[test_case(2025, 1, 0; "no day")]
+    #[test_case(2025, 2, 29; "not a leap year")]
+    fn invalid_dates_are_errors(year: i32, month: i32, day: i32) {
+        let got = field_bytes(&date(year, month, day));
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    #[test_case(0, 0, 0, 0, "00:00:00.000000"; "midnight")]
+    #[test_case(9, 46, 12, 123_456_789, "09:46:12.123456"; "rounds down nanoseconds")]
+    #[test_case(23, 59, 59, 999_999_999, "23:59:59.999999"; "latest")]
+    fn times_are_strings(
+        hours: i32,
+        minutes: i32,
+        seconds: i32,
+        nanos: i32,
+        want: &str,
+    ) -> anyhow::Result<()> {
+        let time = time_of_day(hours, minutes, seconds, nanos);
+        assert_eq!(field_bytes(&time)?, field_bytes(&want.to_string())?);
+        Ok(())
+    }
+
+    #[test_case(24, 0, 0, 0; "end of day")]
+    #[test_case(23, 59, 60, 0; "leap second")]
+    #[test_case(0, 60, 0, 0; "minute 60")]
+    #[test_case(-1, 0, 0, 0; "negative hours")]
+    #[test_case(0, 0, 0, 1_000_000_000; "nanoseconds over one second")]
+    fn invalid_times_are_errors(hours: i32, minutes: i32, seconds: i32, nanos: i32) {
+        let got = field_bytes(&time_of_day(hours, minutes, seconds, nanos));
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    #[test_case(
+        date(2025, 5, 16),
+        time_of_day(9, 46, 12, 123_456_789),
+        "2025-05-16 09:46:12.123456";
+        "rounds down nanoseconds"
+    )]
+    #[test_case(
+        date(1, 1, 1),
+        time_of_day(0, 0, 0, 0),
+        "0001-01-01 00:00:00.000000";
+        "earliest"
+    )]
+    fn datetimes_are_strings(date: Date, time: TimeOfDay, want: &str) -> anyhow::Result<()> {
+        let value = datetime(date, time);
+        assert_eq!(field_bytes(&value)?, field_bytes(&want.to_string())?);
+        Ok(())
+    }
+
+    #[test_case(date(0, 1, 1), time_of_day(0, 0, 0, 0); "no year")]
+    #[test_case(date(1970, 1, 1), time_of_day(24, 0, 0, 0); "end of day")]
+    fn invalid_datetimes_are_errors(date: Date, time: TimeOfDay) {
+        let got = field_bytes(&datetime(date, time));
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    /// The Unix epoch, 1970-01-01 00:00:00, without a time zone.
+    fn local_epoch() -> DateTime {
+        datetime(date(1970, 1, 1), time_of_day(0, 0, 0, 0))
+    }
+
+    #[test_case(local_epoch().set_utc_offset(wkt::Duration::default()); "UTC offset")]
+    #[test_case(local_epoch().set_time_zone(TimeZone::new().set_id("UTC")); "time zone")]
+    fn datetime_with_time_zone_is_an_error(value: DateTime) -> anyhow::Result<()> {
+        let got = field_bytes(&value);
+        assert!(got.is_err(), "{got:?}");
+        // Without the time zone or UTC offset, the same value is valid.
+        let mut local = value;
+        local.time_offset = None;
+        field_bytes(&local)?;
+        Ok(())
+    }
+
+    /// A sample `NUMERIC` value, with more digits than an `f64` keeps.
+    const DECIMAL: &str = "12345678901234567890.123456789";
+
+    #[test]
+    fn decimals_are_strings() -> anyhow::Result<()> {
+        let want = field_bytes(&DECIMAL.to_string())?;
+        let value: rust_decimal::Decimal = DECIMAL.parse()?;
+        assert_eq!(field_bytes(&value)?, want);
+        let value = google_cloud_type::model::Decimal::new().set_value(DECIMAL);
+        assert_eq!(field_bytes(&value)?, want);
+        Ok(())
+    }
+
+    /// What `prost` generates for `message Json { string json = 1; }`.
+    #[derive(Clone, PartialEq, Message)]
+    struct ProstJson {
+        #[prost(string, tag = "1")]
+        json: String,
+    }
+
+    /// Encodes `value`, and parses the JSON string that BigQuery receives.
+    fn sent_json<T: ProtoValue>(value: &T) -> anyhow::Result<wkt::Value> {
+        let json = ProstJson::decode(field_bytes(value)?.as_slice())?.json;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    #[test]
+    fn json_values_are_strings() -> anyhow::Result<()> {
+        let value = serde_json::json!({
+            NAME_COLUMN: NAME,
+            COUNT_COLUMN: COUNT,
+            TAGS_COLUMN: TAGS,
+        });
+        assert_eq!(sent_json(&value)?, value);
+        let object = value.as_object().cloned().expect("value is an object");
+        assert_eq!(sent_json(&object)?, value);
+        // A JSON `null` is a value, not a SQL `NULL`.
+        assert_eq!(sent_json(&wkt::Value::Null)?, wkt::Value::Null);
         Ok(())
     }
 
