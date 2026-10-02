@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Hand-written encoding of rows in the [protobuf wire format].
+//! Hand-written encoding of rows in the [protobuf wire format], and the
+//! schema that describes them.
 //!
 //! A protobuf message is a sequence of fields. Each field is a *tag* (the
 //! field number and a wire type), followed by the value. Field names never
 //! appear on the wire; the schema maps field numbers to column names.
 //!
 //! [protobuf wire format]: https://protobuf.dev/programming-guides/encoding/
+
+use wkt::FieldDescriptorProto;
+use wkt::field_descriptor_proto::{Label, Type};
 
 /// The wire type for length-delimited values, such as strings.
 const LENGTH_DELIMITED: u32 = 2;
@@ -58,10 +62,30 @@ fn encode_string(field_number: u32, value: &str, buf: &mut Vec<u8>) {
     buf.extend_from_slice(value.as_bytes());
 }
 
+/// Describes a `string` field, which BigQuery maps to a `STRING` column.
+fn string_field(name: &str, field_number: u32) -> FieldDescriptorProto {
+    FieldDescriptorProto::new()
+        .set_name(name)
+        .set_number(i32::try_from(field_number).expect("field numbers are at most 2^29 - 1"))
+        // The default label and type are not valid values, always set them.
+        .set_label(Label::Optional)
+        .set_type(Type::String)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::google::cloud::bigquery::storage::v1;
+    use crate::model::ProtoSchema;
+    use gaxi::prost::ToProto;
     use prost::Message;
+    use wkt::DescriptorProto;
+
+    /// The name of the message that describes our row.
+    const ROW: &str = "Row";
+
+    /// The name of the only column in our row.
+    const NAME_COLUMN: &str = "name";
 
     /// The field number of the `name` column in our one-column row.
     const NAME_FIELD: u32 = 1;
@@ -80,6 +104,14 @@ mod tests {
         let mut buf = Vec::new();
         encode_string(NAME_FIELD, name, &mut buf);
         buf
+    }
+
+    /// The schema for `message Row { optional string name = 1; }`.
+    fn row_schema() -> ProtoSchema {
+        let descriptor = DescriptorProto::new()
+            .set_name(ROW)
+            .set_field([string_field(NAME_COLUMN, NAME_FIELD)]);
+        ProtoSchema::new().set_proto_descriptor(descriptor)
     }
 
     #[test]
@@ -126,5 +158,45 @@ mod tests {
         }
         .encode_to_vec();
         assert!(encoded.is_empty(), "{encoded:?}");
+    }
+
+    #[test]
+    fn schema_by_hand() -> anyhow::Result<()> {
+        use prost_types::field_descriptor_proto;
+        // Convert the schema the same way the client does before sending it.
+        let got: v1::ProtoSchema = row_schema().to_proto()?;
+        let want = prost_types::DescriptorProto {
+            name: Some(ROW.to_string()),
+            field: vec![prost_types::FieldDescriptorProto {
+                name: Some(NAME_COLUMN.to_string()),
+                number: Some(i32::try_from(NAME_FIELD)?),
+                label: Some(field_descriptor_proto::Label::Optional as i32),
+                r#type: Some(field_descriptor_proto::Type::String as i32),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(got.proto_descriptor, Some(want));
+        Ok(())
+    }
+
+    #[test]
+    fn default_label_and_type_are_invalid() -> anyhow::Result<()> {
+        use prost_types::field_descriptor_proto;
+        // A field described without a label or a type...
+        let field = FieldDescriptorProto::new()
+            .set_name(NAME_COLUMN)
+            .set_number(i32::try_from(NAME_FIELD)?);
+        let descriptor = DescriptorProto::new().set_name(ROW).set_field([field]);
+        let schema = ProtoSchema::new().set_proto_descriptor(descriptor);
+        let got: v1::ProtoSchema = schema.to_proto()?;
+        let descriptor = got.proto_descriptor.expect("descriptor is set");
+        let field = &descriptor.field[0];
+        // ...is sent with 0 for both, and 0 is neither a valid label nor type.
+        assert_eq!(field.label, Some(0));
+        assert_eq!(field.r#type, Some(0));
+        assert!(field_descriptor_proto::Label::try_from(0).is_err());
+        assert!(field_descriptor_proto::Type::try_from(0).is_err());
+        Ok(())
     }
 }
