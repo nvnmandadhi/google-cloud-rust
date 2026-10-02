@@ -34,6 +34,7 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 /// - `i64`, for `INT64` columns.
 /// - [`Timestamp`](wkt::Timestamp), for `TIMESTAMP` columns. BigQuery keeps
 ///   microseconds, so any nanoseconds are rounded down.
+/// - `Option<T>`, where `T` is one of these types. `None` writes `NULL`.
 ///
 /// # Example
 ///
@@ -45,6 +46,7 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 /// #[derive(ToRow)]
 /// struct Row {
 ///     name: String,
+///     age: Option<i64>,
 /// }
 ///
 /// # async fn sample(client: Write) -> anyhow::Result<()> {
@@ -52,7 +54,11 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 ///     .open_default_stream("projects/my-project/datasets/my_dataset/tables/my_table")
 ///     .build_proto(Row::schema())
 ///     .await?;
-/// let rows = [Row { name: "alice".to_string() }, Row { name: "bob".to_string() }];
+/// let rows = [
+///     Row { name: "alice".to_string(), age: Some(30) },
+///     // `None` writes `NULL` to the `age` column.
+///     Row { name: "bob".to_string(), age: None },
+/// ];
 /// let serialized_rows = rows.iter().map(Row::to_row).collect::<Result<Vec<_>, _>>()?;
 /// writer
 ///     .append(ProtoRows::new().set_serialized_rows(serialized_rows))
@@ -90,8 +96,9 @@ pub trait ProtoValue {
 
     /// Appends `self` to `buf`, as the field with the given number.
     ///
-    /// Implementations always append the field, even for default values such
-    /// as `""` or `0`. BigQuery reads a missing field as `NULL`.
+    /// BigQuery reads a missing field as `NULL`, so implementations append the
+    /// field even for default values such as `""` or `0`. Only `None` leaves
+    /// the field out.
     fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError>;
 }
 
@@ -146,6 +153,21 @@ fn timestamp_micros(timestamp: &wkt::Timestamp) -> i64 {
     timestamp.seconds() * MICROS_PER_SECOND + i64::from(timestamp.nanos() / NANOS_PER_MICRO)
 }
 
+impl<T: ProtoValue> ProtoValue for Option<T> {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // All fields are optional in the schema, so `NULL` needs no changes.
+        T::field_descriptor(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        match self {
+            Some(value) => value.encode(number, buf),
+            // BigQuery reads a missing field as `NULL`.
+            None => Ok(()),
+        }
+    }
+}
+
 /// Returns the schema for a message with the given name and fields.
 ///
 /// This is an implementation detail of [ToRow], it is not part of the public
@@ -160,7 +182,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::timestamp_micros;
+    use super::{ProtoValue, timestamp_micros};
     use crate::google::cloud::bigquery::storage::v1;
     use crate::write::ToRow;
     use gaxi::prost::ToProto;
@@ -211,6 +233,15 @@ mod tests {
     /// digits of the nanoseconds are dropped.
     const CREATED_AT_MICROS: i64 = 1_747_388_772_123_456;
 
+    /// The name of the fourth column in our row, which can be `NULL`.
+    const NICKNAME_COLUMN: &str = "nickname";
+
+    /// The field number of the `nickname` column.
+    const NICKNAME_FIELD: u32 = 4;
+
+    /// A sample value for the `nickname` column.
+    const NICKNAME: &str = "ally";
+
     /// The earliest BigQuery `TIMESTAMP`, 0001-01-01 00:00:00 UTC, in
     /// microseconds since the Unix epoch.
     const MIN_MICROS: i64 = -62_135_596_800_000_000;
@@ -219,16 +250,20 @@ mod tests {
     /// microseconds since the Unix epoch.
     const MAX_MICROS: i64 = 253_402_300_799_999_999;
 
-    /// A row with a `STRING`, an `INT64`, and a `TIMESTAMP` column.
+    /// A row with `STRING`, `INT64`, `TIMESTAMP`, and nullable `STRING`
+    /// columns.
     #[derive(ToRow)]
     struct Row {
         name: String,
         count: i64,
         created_at: Timestamp,
+        nickname: Option<String>,
     }
 
-    /// What `prost` generates for
-    /// `message Row { string name = 1; int64 count = 2; int64 created_at = 3; }`.
+    /// What `prost` generates for:
+    ///
+    /// `message Row { string name = 1; int64 count = 2; int64 created_at = 3;
+    /// optional string nickname = 4; }`
     #[derive(Clone, PartialEq, Message)]
     struct ProstRow {
         #[prost(string, tag = "1")]
@@ -238,6 +273,10 @@ mod tests {
         /// BigQuery takes `TIMESTAMP` values as microseconds since the epoch.
         #[prost(int64, tag = "3")]
         created_at: i64,
+        /// Like `ToRow`, `prost` writes any `Some` value, even an empty
+        /// string, and leaves out `None`.
+        #[prost(string, optional, tag = "4")]
+        nickname: Option<String>,
     }
 
     /// A row with the sample values.
@@ -246,17 +285,18 @@ mod tests {
             name: NAME.to_string(),
             count: COUNT,
             created_at: Timestamp::try_from(CREATED_AT)?,
+            nickname: Some(NICKNAME.to_string()),
         })
     }
 
-    /// The bytes `prost` writes for `sample_row()`.
-    fn sample_row_bytes() -> Vec<u8> {
+    /// The `prost` message with the same values as `sample_row()`.
+    fn sample_prost_row() -> ProstRow {
         ProstRow {
             name: NAME.to_string(),
             count: COUNT,
             created_at: CREATED_AT_MICROS,
+            nickname: Some(NICKNAME.to_string()),
         }
-        .encode_to_vec()
     }
 
     /// What BigQuery receives for `Row::schema()`, written by hand.
@@ -268,6 +308,8 @@ mod tests {
                 sent_field(NAME_COLUMN, NAME_FIELD, Type::String)?,
                 sent_field(COUNT_COLUMN, COUNT_FIELD, Type::Int64)?,
                 sent_field(CREATED_AT_COLUMN, CREATED_AT_FIELD, Type::Int64)?,
+                // `Option<String>` has the same schema as `String`.
+                sent_field(NICKNAME_COLUMN, NICKNAME_FIELD, Type::String)?,
             ],
             ..Default::default()
         })
@@ -299,7 +341,7 @@ mod tests {
 
     #[test]
     fn to_row_matches_prost() -> anyhow::Result<()> {
-        assert_eq!(sample_row()?.to_row()?, sample_row_bytes());
+        assert_eq!(sample_row()?.to_row()?, sample_prost_row().encode_to_vec());
         Ok(())
     }
 
@@ -309,16 +351,43 @@ mod tests {
             name: String::new(),
             count: 0,
             created_at: Timestamp::default(),
+            nickname: Some(String::new()),
         };
         let want = [
             0x0A, 0x00, // name: tag (field 1, length-delimited), length 0
             0x10, 0x00, // count: tag (field 2, varint), value 0
             0x18, 0x00, // created_at: tag (field 3, varint), the epoch is 0
+            0x22, 0x00, // nickname: tag (field 4, length-delimited), length 0
         ];
         assert_eq!(row.to_row()?, want.as_slice());
         // `prost` skips default values, which BigQuery would read as NULLs.
         let encoded = ProstRow::default().encode_to_vec();
         assert!(encoded.is_empty(), "{encoded:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn none_is_left_out() -> anyhow::Result<()> {
+        let row = Row {
+            nickname: None,
+            ..sample_row()?
+        };
+        // There is no `nickname` field, so BigQuery writes `NULL`.
+        let want = ProstRow {
+            nickname: None,
+            ..sample_prost_row()
+        };
+        assert_eq!(row.to_row()?, want.encode_to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn some_zero_is_not_none() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        None::<i64>.encode(COUNT_FIELD, &mut buf)?;
+        assert!(buf.is_empty(), "{buf:?}");
+        Some(0_i64).encode(COUNT_FIELD, &mut buf)?;
+        assert_eq!(buf, [0x10, 0x00]); // tag (field 2, varint), value 0
         Ok(())
     }
 
@@ -400,7 +469,7 @@ mod tests {
         let schema = data.writer_schema.and_then(|s| s.proto_descriptor);
         assert_eq!(schema, Some(sent_descriptor()?));
         let rows = data.rows.map(|r| r.serialized_rows);
-        assert_eq!(rows, Some(vec![sample_row_bytes()]));
+        assert_eq!(rows, Some(vec![sample_prost_row().encode_to_vec()]));
         Ok(())
     }
 }
