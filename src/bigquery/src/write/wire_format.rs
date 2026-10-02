@@ -81,6 +81,9 @@ mod tests {
     use prost::Message;
     use wkt::DescriptorProto;
 
+    /// The table we write to. The mock server accepts any name.
+    const TABLE: &str = "projects/p/datasets/d/tables/t";
+
     /// The name of the message that describes our row.
     const ROW: &str = "Row";
 
@@ -112,6 +115,22 @@ mod tests {
             .set_name(ROW)
             .set_field([string_field(NAME_COLUMN, NAME_FIELD)]);
         ProtoSchema::new().set_proto_descriptor(descriptor)
+    }
+
+    /// What BigQuery receives for `row_schema()`, written by hand.
+    fn sent_descriptor() -> anyhow::Result<prost_types::DescriptorProto> {
+        use prost_types::field_descriptor_proto;
+        Ok(prost_types::DescriptorProto {
+            name: Some(ROW.to_string()),
+            field: vec![prost_types::FieldDescriptorProto {
+                name: Some(NAME_COLUMN.to_string()),
+                number: Some(i32::try_from(NAME_FIELD)?),
+                label: Some(field_descriptor_proto::Label::Optional as i32),
+                r#type: Some(field_descriptor_proto::Type::String as i32),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
     }
 
     #[test]
@@ -162,21 +181,9 @@ mod tests {
 
     #[test]
     fn schema_by_hand() -> anyhow::Result<()> {
-        use prost_types::field_descriptor_proto;
         // Convert the schema the same way the client does before sending it.
         let got: v1::ProtoSchema = row_schema().to_proto()?;
-        let want = prost_types::DescriptorProto {
-            name: Some(ROW.to_string()),
-            field: vec![prost_types::FieldDescriptorProto {
-                name: Some(NAME_COLUMN.to_string()),
-                number: Some(i32::try_from(NAME_FIELD)?),
-                label: Some(field_descriptor_proto::Label::Optional as i32),
-                r#type: Some(field_descriptor_proto::Type::String as i32),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        assert_eq!(got.proto_descriptor, Some(want));
+        assert_eq!(got.proto_descriptor, Some(sent_descriptor()?));
         Ok(())
     }
 
@@ -197,6 +204,68 @@ mod tests {
         assert_eq!(field.r#type, Some(0));
         assert!(field_descriptor_proto::Label::try_from(0).is_err());
         assert!(field_descriptor_proto::Type::try_from(0).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_to_mock_server() -> anyhow::Result<()> {
+        use crate::client::Write;
+        use crate::model::ProtoRows;
+        use bigquery_grpc_mock::google::cloud::bigquery::storage::v1 as mock_v1;
+        use bigquery_grpc_mock::{MockBigQueryWrite, start};
+        use gaxi::grpc::tonic::Response as TonicResponse;
+        use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
+        use mock_v1::append_rows_request::Rows;
+        use mock_v1::append_rows_response::{AppendResult, Response};
+        use tokio::sync::{mpsc, oneshot};
+
+        // The mock server hands us the requests it receives, and replies with
+        // the responses we queue.
+        let (requests_tx, requests_rx) = oneshot::channel();
+        let (response_tx, response_rx) = mpsc::channel(1);
+        let mut mock = MockBigQueryWrite::new();
+        mock.expect_append_rows().return_once(move |request| {
+            let _ = requests_tx.send(request.into_inner());
+            Ok(TonicResponse::from(response_rx))
+        });
+        let (endpoint, _server) = start("0.0.0.0:0", mock).await?;
+
+        // This is what an application writes today, without a derive macro.
+        let client = Write::builder()
+            .with_endpoint(endpoint)
+            .with_credentials(Anonymous::new().build())
+            .build()
+            .await?;
+        let writer = client
+            .open_default_stream(TABLE)
+            .build_proto(row_schema())
+            .await?;
+        let rows = ProtoRows::new().set_serialized_rows([encode_row(NAME)]);
+
+        // Appends to the default stream succeed without an offset.
+        let success = mock_v1::AppendRowsResponse {
+            response: Some(Response::AppendResult(AppendResult { offset: None })),
+            ..Default::default()
+        };
+        response_tx.send(Ok(success)).await?;
+        let response = writer.append(rows).send().await?;
+        assert_eq!(response.offset, None);
+
+        // The mock received our schema and our bytes, unchanged.
+        let mut requests = requests_rx.await?;
+        let request = requests
+            .recv()
+            .await
+            .expect("the mock received a request")?;
+        assert_eq!(request.write_stream, format!("{TABLE}/streams/_default"));
+        let data = match request.rows {
+            Some(Rows::ProtoRows(data)) => data,
+            other => panic!("expected proto rows, got {other:?}"),
+        };
+        let schema = data.writer_schema.and_then(|s| s.proto_descriptor);
+        assert_eq!(schema, Some(sent_descriptor()?));
+        let rows = data.rows.map(|r| r.serialized_rows);
+        assert_eq!(rows, Some(vec![encode_row(NAME)]));
         Ok(())
     }
 }
