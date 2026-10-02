@@ -79,6 +79,11 @@ pub trait ToRow {
 ///
 /// This is an implementation detail of [ToRow], it is not part of the public
 /// API.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a supported field type for `#[derive(ToRow)]`",
+    label = "unsupported field type",
+    note = "see the `ToRow` documentation for the supported types"
+)]
 pub trait ProtoValue {
     /// Describes a field of this type, with the given name and field number.
     fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto;
