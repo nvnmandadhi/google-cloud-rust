@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::wire_format::{encode_int64, encode_string, int64_field, string_field};
+use super::wire_format::{
+    bool_field, bytes_field, double_field, encode_bool, encode_bytes, encode_double, encode_float,
+    encode_int64, encode_string, float_field, int64_field, string_field,
+};
 use crate::error::ConvertError;
 use crate::model::ProtoSchema;
 use bytes::Bytes;
@@ -30,11 +33,18 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 ///
 /// # Supported types
 ///
-/// - `String`, for `STRING` columns.
-/// - `i64`, for `INT64` columns.
-/// - [`Timestamp`](wkt::Timestamp), for `TIMESTAMP` columns. BigQuery keeps
-///   microseconds, so any nanoseconds are rounded down.
-/// - `Option<T>`, where `T` is one of these types. `None` writes `NULL`.
+/// | Rust type | BigQuery type |
+/// | --- | --- |
+/// | `bool` | `BOOL` |
+/// | `i32`, `i64` | `INT64` |
+/// | `f32`, `f64` | `FLOAT64` |
+/// | `String` | `STRING` |
+/// | `Vec<u8>`, [`Bytes`](bytes::Bytes) | `BYTES` |
+/// | [`Timestamp`](wkt::Timestamp) | `TIMESTAMP` |
+/// | `Option<T>` | The type for `T`. `None` writes `NULL`. |
+///
+/// BigQuery keeps microseconds, so the nanoseconds in a
+/// [`Timestamp`](wkt::Timestamp) are rounded down.
 ///
 /// # Example
 ///
@@ -124,6 +134,76 @@ impl ProtoValue for i64 {
     }
 }
 
+impl ProtoValue for i32 {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // `INT64` columns also take `int32` fields, but the bytes would be the
+        // same: protobuf sign-extends negative `int32` values to 64 bits.
+        int64_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_int64(number, i64::from(*self), buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for bool {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        bool_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_bool(number, *self, buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for f64 {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        double_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_double(number, *self, buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for f32 {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        // BigQuery converts `float` fields to `FLOAT64` values. They take 4
+        // bytes instead of 8, which keeps rows smaller.
+        float_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_float(number, *self, buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for Vec<u8> {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        bytes_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_bytes(number, self, buf);
+        Ok(())
+    }
+}
+
+impl ProtoValue for Bytes {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        bytes_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_bytes(number, self, buf);
+        Ok(())
+    }
+}
+
 impl ProtoValue for wkt::Timestamp {
     fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
         // BigQuery takes `TIMESTAMP` values as microseconds since the Unix
@@ -185,6 +265,7 @@ mod tests {
     use super::{ProtoValue, timestamp_micros};
     use crate::google::cloud::bigquery::storage::v1;
     use crate::write::ToRow;
+    use bytes::Bytes;
     use gaxi::prost::ToProto;
     use prost::Message;
     use test_case::test_case;
@@ -388,6 +469,113 @@ mod tests {
         assert!(buf.is_empty(), "{buf:?}");
         Some(0_i64).encode(COUNT_FIELD, &mut buf)?;
         assert_eq!(buf, [0x10, 0x00]); // tag (field 2, varint), value 0
+        Ok(())
+    }
+
+    /// Returns the protobuf type of a field of type `T`. The name and number
+    /// do not matter.
+    fn field_type<T: ProtoValue>() -> wkt::field_descriptor_proto::Type {
+        T::field_descriptor(NAME_COLUMN, NAME_FIELD).r#type
+    }
+
+    #[test]
+    fn field_types() {
+        use wkt::field_descriptor_proto::Type;
+        assert_eq!(field_type::<bool>(), Type::Bool);
+        assert_eq!(field_type::<i32>(), Type::Int64);
+        assert_eq!(field_type::<i64>(), Type::Int64);
+        assert_eq!(field_type::<f32>(), Type::Float);
+        assert_eq!(field_type::<f64>(), Type::Double);
+        assert_eq!(field_type::<String>(), Type::String);
+        assert_eq!(field_type::<Vec<u8>>(), Type::Bytes);
+        assert_eq!(field_type::<Bytes>(), Type::Bytes);
+        assert_eq!(field_type::<Timestamp>(), Type::Int64);
+        assert_eq!(field_type::<Option<String>>(), Type::String);
+    }
+
+    /// A sample value for the `level` column. It is negative, because
+    /// protobuf sign-extends negative values to 64 bits.
+    const LEVEL: i32 = -7;
+
+    /// A sample value for the `ratio` column.
+    const RATIO: f64 = 0.25;
+
+    /// A sample value for the `score` column.
+    const SCORE: f32 = 1.5;
+
+    /// A sample value for the `payload` and `digest` columns. It is not valid
+    /// UTF-8, which `BYTES` columns allow.
+    const PAYLOAD: &[u8] = &[0x00, 0xFF];
+
+    /// A row with the scalar types that `Row` does not have.
+    #[derive(Default, ToRow)]
+    struct Scalars {
+        active: bool,
+        level: i32,
+        ratio: f64,
+        score: f32,
+        payload: Vec<u8>,
+        digest: Bytes,
+    }
+
+    /// What `prost` generates for:
+    ///
+    /// `message Scalars { bool active = 1; int64 level = 2; double ratio = 3;
+    /// float score = 4; bytes payload = 5; bytes digest = 6; }`
+    #[derive(Clone, PartialEq, Message)]
+    struct ProstScalars {
+        #[prost(bool, tag = "1")]
+        active: bool,
+        /// `i32` values are sent as `int64`.
+        #[prost(int64, tag = "2")]
+        level: i64,
+        #[prost(double, tag = "3")]
+        ratio: f64,
+        #[prost(float, tag = "4")]
+        score: f32,
+        #[prost(bytes = "vec", tag = "5")]
+        payload: Vec<u8>,
+        #[prost(bytes = "bytes", tag = "6")]
+        digest: Bytes,
+    }
+
+    #[test]
+    fn scalars_match_prost() -> anyhow::Result<()> {
+        let row = Scalars {
+            active: true,
+            level: LEVEL,
+            ratio: RATIO,
+            score: SCORE,
+            payload: PAYLOAD.to_vec(),
+            digest: Bytes::from_static(PAYLOAD),
+        };
+        let want = ProstScalars {
+            active: true,
+            level: i64::from(LEVEL),
+            ratio: RATIO,
+            score: SCORE,
+            payload: PAYLOAD.to_vec(),
+            digest: Bytes::from_static(PAYLOAD),
+        };
+        assert_eq!(row.to_row()?, want.encode_to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn default_scalars_are_encoded() -> anyhow::Result<()> {
+        let mut want: Vec<u8> = Vec::new();
+        want.extend([0x08, 0x00]); // active: tag (field 1, varint), false
+        want.extend([0x10, 0x00]); // level: tag (field 2, varint), 0
+        want.push(0x19); // ratio: tag (field 3, 64-bit), then 0.0 in 8 bytes
+        want.extend([0x00; 8]);
+        want.push(0x25); // score: tag (field 4, 32-bit), then 0.0 in 4 bytes
+        want.extend([0x00; 4]);
+        want.extend([0x2A, 0x00]); // payload: tag (field 5, length-delimited), length 0
+        want.extend([0x32, 0x00]); // digest: tag (field 6, length-delimited), length 0
+        assert_eq!(Scalars::default().to_row()?, want);
+        // `prost` skips default values, which BigQuery would read as NULLs.
+        let encoded = ProstScalars::default().encode_to_vec();
+        assert!(encoded.is_empty(), "{encoded:?}");
         Ok(())
     }
 
