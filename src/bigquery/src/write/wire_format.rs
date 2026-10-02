@@ -137,6 +137,11 @@ pub(super) fn bytes_field(name: &str, field_number: u32) -> FieldDescriptorProto
     optional_field(name, field_number, Type::Bytes)
 }
 
+/// Makes `field` a repeated field, which BigQuery maps to an `ARRAY` column.
+pub(super) fn repeated_field(field: FieldDescriptorProto) -> FieldDescriptorProto {
+    field.set_label(Label::Repeated)
+}
+
 /// Describes an optional field with the given type.
 fn optional_field(name: &str, field_number: u32, field_type: Type) -> FieldDescriptorProto {
     FieldDescriptorProto::new()

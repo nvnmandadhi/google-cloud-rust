@@ -14,7 +14,7 @@
 
 use super::wire_format::{
     bool_field, bytes_field, double_field, encode_bool, encode_bytes, encode_double, encode_float,
-    encode_int64, encode_string, float_field, int64_field, string_field,
+    encode_int64, encode_string, float_field, int64_field, repeated_field, string_field,
 };
 use crate::error::ConvertError;
 use crate::model::ProtoSchema;
@@ -42,9 +42,15 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 /// | `Vec<u8>`, [`Bytes`](bytes::Bytes) | `BYTES` |
 /// | [`Timestamp`](wkt::Timestamp) | `TIMESTAMP` |
 /// | `Option<T>` | The type for `T`. `None` writes `NULL`. |
+/// | `Vec<T>` | An `ARRAY` of the type for `T`. |
 ///
 /// BigQuery keeps microseconds, so the nanoseconds in a
 /// [`Timestamp`](wkt::Timestamp) are rounded down.
+///
+/// BigQuery arrays cannot contain `NULL` values or other arrays, so the
+/// elements of a `Vec<T>` cannot be `Option` or `Vec` values, except for
+/// `Vec<u8>`, which is a `BYTES` value. Arrays cannot be `NULL` either: `None`
+/// in an `Option<Vec<T>>` writes an empty array.
 ///
 /// # Example
 ///
@@ -107,10 +113,26 @@ pub trait ProtoValue {
     /// Appends `self` to `buf`, as the field with the given number.
     ///
     /// BigQuery reads a missing field as `NULL`, so implementations append the
-    /// field even for default values such as `""` or `0`. Only `None` leaves
-    /// the field out.
+    /// field even for default values such as `""` or `0`. Only `None` and
+    /// empty vectors leave the field out.
     fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError>;
 }
+
+/// A Rust type that can be an element of a `Vec<T>` field.
+///
+/// BigQuery arrays cannot contain `NULL` values or other arrays, so `Option<T>`
+/// and `Vec<T>` do not implement this trait. `Vec<u8>` does, because it is a
+/// `BYTES` value, not an array.
+///
+/// This is an implementation detail of [ToRow], it is not part of the public
+/// API.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a supported array element type for `#[derive(ToRow)]`",
+    label = "unsupported array element type",
+    note = "BigQuery arrays cannot contain `NULL` values or other arrays",
+    note = "see the `ToRow` documentation for the supported types"
+)]
+pub trait ProtoElement: ProtoValue {}
 
 impl ProtoValue for String {
     fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
@@ -248,6 +270,33 @@ impl<T: ProtoValue> ProtoValue for Option<T> {
     }
 }
 
+// Any of the types above can be an array element, except `Option<T>`. There
+// is no implementation for `u8`, so `Vec<u8>` is always a `BYTES` value.
+impl ProtoElement for String {}
+impl ProtoElement for i64 {}
+impl ProtoElement for i32 {}
+impl ProtoElement for bool {}
+impl ProtoElement for f64 {}
+impl ProtoElement for f32 {}
+impl ProtoElement for Vec<u8> {}
+impl ProtoElement for Bytes {}
+impl ProtoElement for wkt::Timestamp {}
+
+impl<T: ProtoElement> ProtoValue for Vec<T> {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        repeated_field(T::field_descriptor(name, number))
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        // Each element is a separate field, with the same field number. An
+        // empty vector appends nothing, which BigQuery reads as an empty array.
+        for value in self {
+            value.encode(number, buf)?;
+        }
+        Ok(())
+    }
+}
+
 /// Returns the schema for a message with the given name and fields.
 ///
 /// This is an implementation detail of [ToRow], it is not part of the public
@@ -323,6 +372,15 @@ mod tests {
     /// A sample value for the `nickname` column.
     const NICKNAME: &str = "ally";
 
+    /// The name of the fifth column in our row, an `ARRAY<STRING>`.
+    const TAGS_COLUMN: &str = "tags";
+
+    /// The field number of the `tags` column.
+    const TAGS_FIELD: u32 = 5;
+
+    /// Sample values for the `tags` column.
+    const TAGS: [&str; 2] = ["admin", "beta"];
+
     /// The earliest BigQuery `TIMESTAMP`, 0001-01-01 00:00:00 UTC, in
     /// microseconds since the Unix epoch.
     const MIN_MICROS: i64 = -62_135_596_800_000_000;
@@ -331,20 +389,21 @@ mod tests {
     /// microseconds since the Unix epoch.
     const MAX_MICROS: i64 = 253_402_300_799_999_999;
 
-    /// A row with `STRING`, `INT64`, `TIMESTAMP`, and nullable `STRING`
-    /// columns.
+    /// A row with `STRING`, `INT64`, `TIMESTAMP`, nullable `STRING`, and
+    /// `ARRAY<STRING>` columns.
     #[derive(ToRow)]
     struct Row {
         name: String,
         count: i64,
         created_at: Timestamp,
         nickname: Option<String>,
+        tags: Vec<String>,
     }
 
     /// What `prost` generates for:
     ///
     /// `message Row { string name = 1; int64 count = 2; int64 created_at = 3;
-    /// optional string nickname = 4; }`
+    /// optional string nickname = 4; repeated string tags = 5; }`
     #[derive(Clone, PartialEq, Message)]
     struct ProstRow {
         #[prost(string, tag = "1")]
@@ -358,6 +417,9 @@ mod tests {
         /// string, and leaves out `None`.
         #[prost(string, optional, tag = "4")]
         nickname: Option<String>,
+        /// Like `ToRow`, `prost` writes each element as a separate field.
+        #[prost(string, repeated, tag = "5")]
+        tags: Vec<String>,
     }
 
     /// A row with the sample values.
@@ -367,6 +429,7 @@ mod tests {
             count: COUNT,
             created_at: Timestamp::try_from(CREATED_AT)?,
             nickname: Some(NICKNAME.to_string()),
+            tags: TAGS.map(String::from).into(),
         })
     }
 
@@ -377,6 +440,7 @@ mod tests {
             count: COUNT,
             created_at: CREATED_AT_MICROS,
             nickname: Some(NICKNAME.to_string()),
+            tags: TAGS.map(String::from).into(),
         }
     }
 
@@ -391,6 +455,7 @@ mod tests {
                 sent_field(CREATED_AT_COLUMN, CREATED_AT_FIELD, Type::Int64)?,
                 // `Option<String>` has the same schema as `String`.
                 sent_field(NICKNAME_COLUMN, NICKNAME_FIELD, Type::String)?,
+                sent_repeated_field(TAGS_COLUMN, TAGS_FIELD, Type::String)?,
             ],
             ..Default::default()
         })
@@ -409,6 +474,19 @@ mod tests {
             label: Some(Label::Optional as i32),
             r#type: Some(field_type as i32),
             ..Default::default()
+        })
+    }
+
+    /// What BigQuery receives for one repeated field, written by hand.
+    fn sent_repeated_field(
+        name: &str,
+        number: u32,
+        field_type: prost_types::field_descriptor_proto::Type,
+    ) -> anyhow::Result<prost_types::FieldDescriptorProto> {
+        use prost_types::field_descriptor_proto::Label;
+        Ok(prost_types::FieldDescriptorProto {
+            label: Some(Label::Repeated as i32),
+            ..sent_field(name, number, field_type)?
         })
     }
 
@@ -433,6 +511,8 @@ mod tests {
             count: 0,
             created_at: Timestamp::default(),
             nickname: Some(String::new()),
+            // An empty array appends nothing.
+            tags: Vec::new(),
         };
         let want = [
             0x0A, 0x00, // name: tag (field 1, length-delimited), length 0
@@ -491,6 +571,61 @@ mod tests {
         assert_eq!(field_type::<Bytes>(), Type::Bytes);
         assert_eq!(field_type::<Timestamp>(), Type::Int64);
         assert_eq!(field_type::<Option<String>>(), Type::String);
+        // An array has the type of its elements.
+        assert_eq!(field_type::<Vec<i64>>(), Type::Int64);
+        assert_eq!(field_type::<Vec<Vec<u8>>>(), Type::Bytes);
+    }
+
+    /// Returns the label of a field of type `T`. The name and number do not
+    /// matter.
+    fn field_label<T: ProtoValue>() -> wkt::field_descriptor_proto::Label {
+        T::field_descriptor(NAME_COLUMN, NAME_FIELD).label
+    }
+
+    #[test]
+    fn field_labels() {
+        use wkt::field_descriptor_proto::Label;
+        assert_eq!(field_label::<i64>(), Label::Optional);
+        assert_eq!(field_label::<Option<i64>>(), Label::Optional);
+        assert_eq!(field_label::<Vec<i64>>(), Label::Repeated);
+        // `Vec<u8>` is a `BYTES` value, not an array.
+        assert_eq!(field_label::<Vec<u8>>(), Label::Optional);
+        assert_eq!(field_label::<Vec<Vec<u8>>>(), Label::Repeated);
+        // Arrays cannot be `NULL`, so `None` writes an empty array.
+        assert_eq!(field_label::<Option<Vec<i64>>>(), Label::Repeated);
+    }
+
+    /// What `prost` generates for:
+    ///
+    /// `message Counts { repeated int64 counts = 2 [packed = false]; }`
+    #[derive(Clone, PartialEq, Message)]
+    struct ProstCounts {
+        /// By default, `prost` packs repeated numbers: one tag, the length,
+        /// and then all the values. Protobuf parsers accept both forms.
+        #[prost(int64, repeated, packed = "false", tag = "2")]
+        counts: Vec<i64>,
+    }
+
+    #[test]
+    fn repeated_field_by_hand() -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        vec![COUNT, 0].encode(COUNT_FIELD, &mut buf)?;
+        // Each element is a separate field, with the same tag.
+        let want = [
+            0x10, 0x2A, // tag (field 2, varint), 42
+            0x10, 0x00, // tag (field 2, varint), 0
+        ];
+        assert_eq!(buf, want);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_field_matches_prost() -> anyhow::Result<()> {
+        let counts = vec![COUNT, 0, -COUNT];
+        let mut buf = Vec::new();
+        counts.encode(COUNT_FIELD, &mut buf)?;
+        assert_eq!(buf, ProstCounts { counts }.encode_to_vec());
+        Ok(())
     }
 
     /// A sample value for the `level` column. It is negative, because
