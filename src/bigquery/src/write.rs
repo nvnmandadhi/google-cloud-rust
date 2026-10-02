@@ -58,3 +58,7 @@ pub(crate) mod generated;
 
 #[cfg(test)]
 mod test;
+
+// TODO(#7088) - test-only until the derive macro uses it.
+#[cfg(test)]
+mod wire_format;
