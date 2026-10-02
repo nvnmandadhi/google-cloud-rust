@@ -24,6 +24,9 @@
 use wkt::FieldDescriptorProto;
 use wkt::field_descriptor_proto::{Label, Type};
 
+/// The wire type for varints, such as `int64` values.
+const VARINT: u32 = 0;
+
 /// The wire type for length-delimited values, such as strings.
 const LENGTH_DELIMITED: u32 = 2;
 
@@ -62,14 +65,33 @@ pub(super) fn encode_string(field_number: u32, value: &str, buf: &mut Vec<u8>) {
     buf.extend_from_slice(value.as_bytes());
 }
 
+/// Appends an `int64` field: the tag, and the value as a varint.
+///
+/// Negative values are sign-extended to 64 bits (two's complement), so they
+/// always take 10 bytes. This is how protobuf encodes `int64`.
+pub(super) fn encode_int64(field_number: u32, value: i64, buf: &mut Vec<u8>) {
+    encode_tag(field_number, VARINT, buf);
+    encode_varint(value as u64, buf);
+}
+
 /// Describes a `string` field, which BigQuery maps to a `STRING` column.
 pub(super) fn string_field(name: &str, field_number: u32) -> FieldDescriptorProto {
+    optional_field(name, field_number, Type::String)
+}
+
+/// Describes an `int64` field, which BigQuery maps to an `INT64` column.
+pub(super) fn int64_field(name: &str, field_number: u32) -> FieldDescriptorProto {
+    optional_field(name, field_number, Type::Int64)
+}
+
+/// Describes an optional field with the given type.
+fn optional_field(name: &str, field_number: u32, field_type: Type) -> FieldDescriptorProto {
     FieldDescriptorProto::new()
         .set_name(name)
         .set_number(i32::try_from(field_number).expect("field numbers are at most 2^29 - 1"))
         // The default label and type are not valid values, always set them.
         .set_label(Label::Optional)
-        .set_type(Type::String)
+        .set_type(field_type)
 }
 
 #[cfg(test)]
@@ -79,6 +101,7 @@ mod tests {
     use crate::model::ProtoSchema;
     use gaxi::prost::ToProto;
     use prost::Message;
+    use test_case::test_case;
     use wkt::DescriptorProto;
 
     /// The name of the message that describes our row.
@@ -170,5 +193,65 @@ mod tests {
         assert!(field_descriptor_proto::Label::try_from(0).is_err());
         assert!(field_descriptor_proto::Type::try_from(0).is_err());
         Ok(())
+    }
+
+    /// The field number of the `count` column, the second in our row.
+    const COUNT_FIELD: u32 = 2;
+
+    /// The number in the varint example of the protobuf encoding guide.
+    const GUIDE_EXAMPLE: i64 = 150;
+
+    /// What `prost` generates for `message Row { int64 count = 2; }`.
+    #[derive(Clone, PartialEq, Message)]
+    struct ProstCount {
+        #[prost(int64, tag = "2")]
+        count: i64,
+    }
+
+    fn encode_count(count: i64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_int64(COUNT_FIELD, count, &mut buf);
+        buf
+    }
+
+    #[test]
+    fn encode_int64_by_hand() {
+        // 150 needs 8 bits, so it takes two varint bytes:
+        //   150 = 0b1_0010110
+        //   0010110 + continuation bit 1 -> 0b1001_0110 = 0x96
+        //   0000001 + continuation bit 0 -> 0b0000_0001 = 0x01
+        let want = [
+            0x10, // tag: (field number 2 << 3) | wire type 0 (varint)
+            0x96, 0x01,
+        ];
+        assert_eq!(encode_count(GUIDE_EXAMPLE), want);
+    }
+
+    #[test_case(GUIDE_EXAMPLE; "guide example")]
+    #[test_case(-1; "minus one")]
+    #[test_case(i64::MAX; "max")]
+    #[test_case(i64::MIN; "min")]
+    fn int64_matches_prost(count: i64) {
+        let want = ProstCount { count }.encode_to_vec();
+        assert_eq!(encode_count(count), want);
+    }
+
+    #[test]
+    fn negative_int64_takes_ten_bytes() {
+        // -1 is 64 one bits in two's complement. At 7 bits per byte, that is
+        // nine full bytes, and one more byte for the last bit.
+        let mut want = vec![0x10]; // tag
+        want.extend([0xFF; 9]); // 7 one bits + continuation bit 1
+        want.push(0x01); // the last one bit + continuation bit 0
+        assert_eq!(encode_count(-1), want);
+    }
+
+    #[test]
+    fn zero_int64_is_encoded() {
+        // We always write the field, even if the value is zero.
+        assert_eq!(encode_count(0), [0x10, 0x00]);
+        // `prost` skips default values, which BigQuery would read as NULL.
+        let encoded = ProstCount { count: 0 }.encode_to_vec();
+        assert!(encoded.is_empty(), "{encoded:?}");
     }
 }

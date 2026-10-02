@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::wire_format::{encode_string, string_field};
+use super::wire_format::{encode_int64, encode_string, int64_field, string_field};
 use crate::error::ConvertError;
 use crate::model::ProtoSchema;
 use bytes::Bytes;
@@ -31,6 +31,7 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 /// # Supported types
 ///
 /// - `String`, for `STRING` columns.
+/// - `i64`, for `INT64` columns.
 ///
 /// # Example
 ///
@@ -98,6 +99,17 @@ impl ProtoValue for String {
     }
 }
 
+impl ProtoValue for i64 {
+    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+        int64_field(name, number)
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_int64(number, *self, buf);
+        Ok(())
+    }
+}
+
 /// Returns the schema for a message with the given name and fields.
 ///
 /// This is an implementation detail of [ToRow], it is not part of the public
@@ -128,40 +140,84 @@ mod tests {
     /// The name of the message that describes our row.
     const ROW: &str = "Row";
 
-    /// The name of the only column in our row.
+    /// The name of the first column in our row.
     const NAME_COLUMN: &str = "name";
 
-    /// The field number of the `name` column in our one-column row.
+    /// The field number of the `name` column.
     const NAME_FIELD: u32 = 1;
 
     /// A sample value for the `name` column.
     const NAME: &str = "alice";
 
-    /// A row with one `STRING` column.
+    /// The name of the second column in our row.
+    const COUNT_COLUMN: &str = "count";
+
+    /// The field number of the `count` column.
+    const COUNT_FIELD: u32 = 2;
+
+    /// A sample value for the `count` column. It is not zero, because `prost`
+    /// skips zeros, and then there would be nothing to compare.
+    const COUNT: i64 = 42;
+
+    /// A row with a `STRING` and an `INT64` column.
     #[derive(ToRow)]
     struct Row {
         name: String,
+        count: i64,
     }
 
-    /// What `prost` generates for `message Row { string name = 1; }`.
+    /// What `prost` generates for
+    /// `message Row { string name = 1; int64 count = 2; }`.
     #[derive(Clone, PartialEq, Message)]
     struct ProstRow {
         #[prost(string, tag = "1")]
         name: String,
+        #[prost(int64, tag = "2")]
+        count: i64,
+    }
+
+    /// A row with the sample values.
+    fn sample_row() -> Row {
+        Row {
+            name: NAME.to_string(),
+            count: COUNT,
+        }
+    }
+
+    /// The bytes `prost` writes for `sample_row()`.
+    fn sample_row_bytes() -> Vec<u8> {
+        ProstRow {
+            name: NAME.to_string(),
+            count: COUNT,
+        }
+        .encode_to_vec()
     }
 
     /// What BigQuery receives for `Row::schema()`, written by hand.
     fn sent_descriptor() -> anyhow::Result<prost_types::DescriptorProto> {
-        use prost_types::field_descriptor_proto;
+        use prost_types::field_descriptor_proto::Type;
         Ok(prost_types::DescriptorProto {
             name: Some(ROW.to_string()),
-            field: vec![prost_types::FieldDescriptorProto {
-                name: Some(NAME_COLUMN.to_string()),
-                number: Some(i32::try_from(NAME_FIELD)?),
-                label: Some(field_descriptor_proto::Label::Optional as i32),
-                r#type: Some(field_descriptor_proto::Type::String as i32),
-                ..Default::default()
-            }],
+            field: vec![
+                sent_field(NAME_COLUMN, NAME_FIELD, Type::String)?,
+                sent_field(COUNT_COLUMN, COUNT_FIELD, Type::Int64)?,
+            ],
+            ..Default::default()
+        })
+    }
+
+    /// What BigQuery receives for one optional field, written by hand.
+    fn sent_field(
+        name: &str,
+        number: u32,
+        field_type: prost_types::field_descriptor_proto::Type,
+    ) -> anyhow::Result<prost_types::FieldDescriptorProto> {
+        use prost_types::field_descriptor_proto::Label;
+        Ok(prost_types::FieldDescriptorProto {
+            name: Some(name.to_string()),
+            number: Some(i32::try_from(number)?),
+            label: Some(Label::Optional as i32),
+            r#type: Some(field_type as i32),
             ..Default::default()
         })
     }
@@ -176,14 +232,24 @@ mod tests {
 
     #[test]
     fn to_row_matches_prost() -> anyhow::Result<()> {
+        assert_eq!(sample_row().to_row()?, sample_row_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn default_values_are_encoded() -> anyhow::Result<()> {
         let row = Row {
-            name: NAME.to_string(),
+            name: String::new(),
+            count: 0,
         };
-        let want = ProstRow {
-            name: NAME.to_string(),
-        }
-        .encode_to_vec();
-        assert_eq!(row.to_row()?, want);
+        let want = [
+            0x0A, 0x00, // name: tag (field 1, length-delimited), length 0
+            0x10, 0x00, // count: tag (field 2, varint), value 0
+        ];
+        assert_eq!(row.to_row()?, want.as_slice());
+        // `prost` skips default values, which BigQuery would read as NULLs.
+        let encoded = ProstRow::default().encode_to_vec();
+        assert!(encoded.is_empty(), "{encoded:?}");
         Ok(())
     }
 
@@ -220,10 +286,7 @@ mod tests {
             .open_default_stream(TABLE)
             .build_proto(Row::schema())
             .await?;
-        let row = Row {
-            name: NAME.to_string(),
-        };
-        let rows = ProtoRows::new().set_serialized_rows([row.to_row()?]);
+        let rows = ProtoRows::new().set_serialized_rows([sample_row().to_row()?]);
 
         // Appends to the default stream succeed without an offset.
         let success = mock_v1::AppendRowsResponse {
@@ -247,12 +310,8 @@ mod tests {
         };
         let schema = data.writer_schema.and_then(|s| s.proto_descriptor);
         assert_eq!(schema, Some(sent_descriptor()?));
-        let want = ProstRow {
-            name: NAME.to_string(),
-        }
-        .encode_to_vec();
         let rows = data.rows.map(|r| r.serialized_rows);
-        assert_eq!(rows, Some(vec![want]));
+        assert_eq!(rows, Some(vec![sample_row_bytes()]));
         Ok(())
     }
 }
