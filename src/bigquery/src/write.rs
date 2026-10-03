@@ -37,7 +37,8 @@ pub mod stream_type;
 #[doc(hidden)]
 pub mod __private {
     pub use super::to_row::{
-        NestedTypes, ProtoElement, ProtoMessage, ProtoValue, encode_row, message_schema,
+        NestedTypes, ProtoElement, ProtoMessage, ProtoValue, encode_message, encode_row,
+        message_schema, struct_field_descriptor,
     };
     pub use bytes::Bytes;
     pub use wkt::FieldDescriptorProto;

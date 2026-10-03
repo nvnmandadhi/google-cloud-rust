@@ -14,8 +14,10 @@
 
 use super::wire_format::{
     bool_field, bytes_field, double_field, encode_bool, encode_bytes, encode_double, encode_float,
-    encode_int64, encode_string, float_field, int64_field, repeated_field, string_field,
+    encode_int64, encode_string, float_field, int64_field, message_field, repeated_field,
+    string_field,
 };
+use crate::datatypes::{Range, RangeElement};
 use crate::error::ConvertError;
 use crate::model::ProtoSchema;
 use bytes::Bytes;
@@ -46,6 +48,8 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 /// | [`TimeOfDay`](google_cloud_type::model::TimeOfDay) | `TIME` |
 /// | [`Timestamp`](wkt::Timestamp) | `TIMESTAMP` |
 /// | [`Value`](wkt::Value), [`Struct`](wkt::Struct) | `JSON` |
+/// | [`Range<T>`](crate::datatypes::Range) | `RANGE<T>` |
+/// | A struct with `#[derive(ToRow)]` | `STRUCT` |
 /// | `Option<T>` | The type for `T`. `None` writes `NULL`. |
 /// | `Vec<T>` | An `ARRAY` of the type for `T`. |
 ///
@@ -62,6 +66,11 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 ///   elements of a `Vec<T>` cannot be `Option` or `Vec` values, except for
 ///   `Vec<u8>`, which is a `BYTES` value. Arrays cannot be `NULL` either:
 ///   `None` in an `Option<Vec<T>>` writes an empty array.
+/// - A [`Range<T>`](crate::datatypes::Range) without a `start` or an `end` is
+///   unbounded on that side. BigQuery rejects ranges where the start is not
+///   before the end.
+/// - BigQuery supports at most 15 levels of nested `STRUCT` columns. Structs
+///   cannot contain themselves, not even in a `Vec<T>`.
 ///
 /// # Example
 ///
@@ -95,11 +104,62 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 /// # }
 /// ```
 ///
+/// # Nested structs and ranges
+///
+/// A struct with `#[derive(ToRow)]` can be a field in another one, for a
+/// `STRUCT` column.
+///
+/// ```
+/// use google_cloud_bigquery::datatypes::Range;
+/// use google_cloud_bigquery::write::ToRow;
+/// use google_cloud_type::model::Date;
+///
+/// // For a `STRUCT<city STRING, zip STRING>` column.
+/// #[derive(ToRow)]
+/// struct Address {
+///     city: String,
+///     zip: Option<String>,
+/// }
+///
+/// #[derive(ToRow)]
+/// struct Customer {
+///     name: String,
+///     // `None` writes a `NULL` struct.
+///     address: Option<Address>,
+///     // For an `ARRAY<STRUCT<city STRING, zip STRING>>` column.
+///     previous_addresses: Vec<Address>,
+///     // For a `RANGE<DATE>` column.
+///     membership: Range<Date>,
+/// }
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let start = Date::new().set_year(2025).set_month(1).set_day(1);
+/// let customer = Customer {
+///     name: "alice".to_string(),
+///     address: Some(Address { city: "Paris".to_string(), zip: None }),
+///     previous_addresses: Vec::new(),
+///     // From 2025-01-01, with no end.
+///     membership: Range::new().set_start(start),
+/// };
+/// // Use them as in the example above.
+/// let schema = Customer::schema();
+/// let row = customer.to_row()?;
+/// # Ok(())
+/// # }
+/// ```
+///
 /// [Proto]: crate::write::format::Proto
 pub trait ToRow {
     /// Returns the schema for rows of this type.
     ///
     /// Use it to create a writer with [build_proto].
+    ///
+    /// # Panics
+    ///
+    /// The implementation from `#[derive(ToRow)]` panics if structs are nested
+    /// more than 15 levels deep, or if a struct contains itself. Both depend
+    /// only on the types, not on any values, so any test that calls this
+    /// function finds them.
     ///
     /// [build_proto]: crate::builder::write::WriterBuilder::build_proto
     fn schema() -> ProtoSchema;
@@ -115,6 +175,7 @@ pub trait ToRow {
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a supported field type for `#[derive(ToRow)]`",
     label = "unsupported field type",
+    note = "structs must have `#[derive(ToRow)]` to be used as fields",
     note = "see the `ToRow` documentation for the supported types"
 )]
 pub trait ProtoValue {
@@ -147,7 +208,8 @@ pub trait ProtoValue {
 )]
 pub trait ProtoElement: ProtoValue {}
 
-/// A Rust type that is written as a protobuf message, such as a row.
+/// A Rust type that is written as a protobuf message: a row, a nested struct,
+/// or a `RANGE` value.
 ///
 /// `#[derive(ToRow)]` implements this trait, and [ToRow] uses it to describe
 /// and encode rows.
@@ -157,6 +219,13 @@ pub trait ProtoElement: ProtoValue {}
 pub trait ProtoMessage {
     /// The name of the message.
     const NAME: &'static str;
+
+    /// The names of the fields.
+    ///
+    /// In a row, these are the column names. The message types for nested
+    /// structs are declared inside the message for the row, so they cannot
+    /// use these names.
+    const COLUMNS: &'static [&'static str];
 
     /// Describes the fields of the message.
     fn fields(types: &mut NestedTypes) -> Vec<FieldDescriptorProto>;
@@ -499,23 +568,151 @@ impl<T: ProtoElement> ProtoValue for Vec<T> {
     }
 }
 
+/// The name of the message type for `RANGE` values.
+const RANGE_MESSAGE: &str = "Range";
+
+/// The name of the field for the start of a `RANGE` value.
+const RANGE_START: &str = "start";
+
+/// The field number of `start`.
+const RANGE_START_FIELD: u32 = 1;
+
+/// The name of the field for the end of a `RANGE` value.
+const RANGE_END: &str = "end";
+
+/// The field number of `end`.
+const RANGE_END_FIELD: u32 = 2;
+
+// BigQuery takes `RANGE<T>` values as a message with two fields, `start` and
+// `end`, of the type for `T`.
+impl<T: RangeElement + ProtoValue> ProtoMessage for Range<T> {
+    const NAME: &'static str = RANGE_MESSAGE;
+    const COLUMNS: &'static [&'static str] = &[RANGE_START, RANGE_END];
+
+    fn fields(types: &mut NestedTypes) -> Vec<FieldDescriptorProto> {
+        vec![
+            Option::<T>::field_descriptor(RANGE_START, RANGE_START_FIELD, types),
+            Option::<T>::field_descriptor(RANGE_END, RANGE_END_FIELD, types),
+        ]
+    }
+
+    fn encode_fields(&self, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        // `None` leaves the field out, which BigQuery reads as unbounded.
+        self.start.encode(RANGE_START_FIELD, buf)?;
+        self.end.encode(RANGE_END_FIELD, buf)
+    }
+}
+
+impl<T: RangeElement + ProtoValue> ProtoValue for Range<T> {
+    fn field_descriptor(name: &str, number: u32, types: &mut NestedTypes) -> FieldDescriptorProto {
+        // A `RANGE` column is not a `STRUCT` column, so it does not count
+        // toward the limit on nested `STRUCT` columns.
+        message_field(name, number, &types.add_message::<Self>())
+    }
+
+    fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        encode_message(self, number, buf)
+    }
+}
+
+impl<T: RangeElement + ProtoValue> ProtoElement for Range<T> {}
+
+/// BigQuery supports at most 15 levels of nested `STRUCT` columns.
+const MAX_DEPTH: usize = 15;
+
+/// The suffix for the second message type with the same name, as in
+/// `Address_2`.
+const FIRST_SUFFIX: usize = 2;
+
 /// The message types that a schema needs, besides the message for the row.
 ///
 /// BigQuery needs a self-contained schema, so these types are nested in the
-/// message for the row.
+/// message for the row. They are all nested at the same level, even types
+/// that only appear inside other nested types, so each type is declared once.
 ///
 /// This is an implementation detail of [ToRow], it is not part of the public
 /// API.
 #[derive(Debug, Default)]
 pub struct NestedTypes {
-    /// The descriptors of the types, in the order they were added.
-    types: Vec<DescriptorProto>,
+    /// The name before any suffix, and the descriptor, of each type. In the
+    /// order they were added.
+    types: Vec<(&'static str, DescriptorProto)>,
+    /// The names of the fields in the message for the row. The nested types
+    /// share a scope with these fields, so they cannot use these names.
+    reserved: &'static [&'static str],
+    /// How many levels of nested structs are being described.
+    depth: usize,
 }
 
 impl NestedTypes {
+    /// Returns an empty set of types, for a row with the given column names.
+    fn new(columns: &'static [&'static str]) -> Self {
+        Self {
+            types: Vec::new(),
+            reserved: columns,
+            depth: 0,
+        }
+    }
+
+    /// Adds the message type for the nested struct `T`, and returns its name.
+    ///
+    /// # Panics
+    ///
+    /// If `T` is nested more than [MAX_DEPTH] levels deep, which includes any
+    /// struct that contains itself.
+    fn add_struct<T: ProtoMessage>(&mut self) -> String {
+        self.depth += 1;
+        assert!(
+            self.depth <= MAX_DEPTH,
+            "`{}` is nested more than {MAX_DEPTH} levels deep, or contains itself. \
+             BigQuery supports at most {MAX_DEPTH} levels of nested `STRUCT` columns.",
+            std::any::type_name::<T>()
+        );
+        let name = self.add_message::<T>();
+        self.depth -= 1;
+        name
+    }
+
+    /// Adds the message type for `T`, and returns its name.
+    ///
+    /// A type with the same name and the same fields as an earlier type is not
+    /// added again, so a struct in many fields is declared once. Different
+    /// types with the same name, such as `Address` structs from two modules,
+    /// get a suffix.
+    fn add_message<T: ProtoMessage>(&mut self) -> String {
+        // The fields come first, because they may add types too.
+        let fields = T::fields(self);
+        let existing = self
+            .types
+            .iter()
+            .find(|(base, descriptor)| *base == T::NAME && descriptor.field == fields);
+        if let Some((_, descriptor)) = existing {
+            return descriptor.name.clone();
+        }
+        let name = self.unused_name(T::NAME);
+        let descriptor = DescriptorProto::new().set_name(&name).set_field(fields);
+        self.types.push((T::NAME, descriptor));
+        name
+    }
+
+    /// Returns `name`, or `name` with the first suffix that is not taken.
+    fn unused_name(&self, name: &str) -> String {
+        let taken = |candidate: &str| {
+            self.reserved.contains(&candidate)
+                || self.types.iter().any(|(_, d)| d.name == candidate)
+        };
+        if !taken(name) {
+            return name.to_string();
+        }
+        (FIRST_SUFFIX..)
+            .map(|suffix| format!("{name}_{suffix}"))
+            .find(|candidate| !taken(candidate))
+            .expect("there are more suffixes than types")
+    }
+
     /// Returns the descriptors of the types, in the order they were added.
     fn into_descriptors(self) -> Vec<DescriptorProto> {
-        self.types
+        self.types.into_iter().map(|(_, d)| d).collect()
     }
 }
 
@@ -524,7 +721,7 @@ impl NestedTypes {
 /// This is an implementation detail of [ToRow], it is not part of the public
 /// API.
 pub fn message_schema<T: ProtoMessage>() -> ProtoSchema {
-    let mut types = NestedTypes::default();
+    let mut types = NestedTypes::new(T::COLUMNS);
     let fields = T::fields(&mut types);
     let descriptor = DescriptorProto::new()
         .set_name(T::NAME)
@@ -543,9 +740,45 @@ pub fn encode_row<T: ProtoMessage>(row: &T) -> Result<Bytes, ConvertError> {
     Ok(buf.into())
 }
 
+/// Describes a field that holds the nested struct `T`.
+///
+/// This is an implementation detail of [ToRow], it is not part of the public
+/// API.
+///
+/// # Panics
+///
+/// If `T` is nested more than 15 levels deep, which includes any struct that
+/// contains itself.
+pub fn struct_field_descriptor<T: ProtoMessage>(
+    name: &str,
+    number: u32,
+    types: &mut NestedTypes,
+) -> FieldDescriptorProto {
+    message_field(name, number, &types.add_struct::<T>())
+}
+
+/// Appends `value` to `buf`, as a message in the field with the given number.
+///
+/// This is an implementation detail of [ToRow], it is not part of the public
+/// API.
+pub fn encode_message<T: ProtoMessage>(
+    value: &T,
+    number: u32,
+    buf: &mut Vec<u8>,
+) -> Result<(), ConvertError> {
+    // The length of the message comes before its fields, so encode the fields
+    // on their own first. An empty message still appends the tag and a zero
+    // length, which is not the same as leaving the field out.
+    let mut message = Vec::new();
+    value.encode_fields(&mut message)?;
+    encode_bytes(number, &message, buf);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NestedTypes, ProtoValue, timestamp_micros};
+    use super::{MAX_DEPTH, NestedTypes, ProtoMessage, ProtoValue, timestamp_micros};
+    use crate::datatypes::Range;
     use crate::error::ConvertError;
     use crate::google::cloud::bigquery::storage::v1;
     use crate::write::ToRow;
@@ -817,9 +1050,13 @@ mod tests {
         assert_eq!(field_type::<wkt::Value>(), Type::String);
         assert_eq!(field_type::<wkt::Struct>(), Type::String);
         assert_eq!(field_type::<Option<String>>(), Type::String);
+        // Nested structs and ranges are messages.
+        assert_eq!(field_type::<Address>(), Type::Message);
+        assert_eq!(field_type::<Range<Date>>(), Type::Message);
         // An array has the type of its elements.
         assert_eq!(field_type::<Vec<i64>>(), Type::Int64);
         assert_eq!(field_type::<Vec<Vec<u8>>>(), Type::Bytes);
+        assert_eq!(field_type::<Vec<Address>>(), Type::Message);
     }
 
     /// Returns the label of a field of type `T`. The name and number do not
@@ -839,6 +1076,9 @@ mod tests {
         assert_eq!(field_label::<Vec<Vec<u8>>>(), Label::Repeated);
         // Arrays cannot be `NULL`, so `None` writes an empty array.
         assert_eq!(field_label::<Option<Vec<i64>>>(), Label::Repeated);
+        assert_eq!(field_label::<Option<Address>>(), Label::Optional);
+        assert_eq!(field_label::<Vec<Address>>(), Label::Repeated);
+        assert_eq!(field_label::<Vec<Range<Date>>>(), Label::Repeated);
     }
 
     /// What `prost` generates for:
@@ -1208,6 +1448,450 @@ mod tests {
         assert_eq!(schema, Some(sent_descriptor()?));
         let rows = data.rows.map(|r| r.serialized_rows);
         assert_eq!(rows, Some(vec![sample_prost_row().encode_to_vec()]));
+        Ok(())
+    }
+
+    /// The name of the message type for `Address`.
+    const ADDRESS: &str = "Address";
+
+    /// The name of the only field in `Address`.
+    const CITY_COLUMN: &str = "city";
+
+    /// The field number of `city`.
+    const CITY_FIELD: u32 = 1;
+
+    /// A sample value for `city`.
+    const CITY: &str = "NYC";
+
+    /// A struct for a `STRUCT<city STRING>` column.
+    #[derive(ToRow)]
+    struct Address {
+        city: Option<String>,
+    }
+
+    /// The name of the message type for `Customer`.
+    const CUSTOMER: &str = "Customer";
+
+    /// The name of the `STRUCT` column in `Customer`.
+    const ADDRESS_COLUMN: &str = "address";
+
+    /// The field number of `address`.
+    const ADDRESS_FIELD: u32 = 2;
+
+    /// The name of the `ARRAY<STRUCT>` column in `Customer`.
+    const PREVIOUS_COLUMN: &str = "previous";
+
+    /// The field number of `previous`.
+    const PREVIOUS_FIELD: u32 = 3;
+
+    /// A row with a `STRING` column, a nullable `STRUCT` column, and an
+    /// `ARRAY<STRUCT>` column.
+    #[derive(ToRow)]
+    struct Customer {
+        name: String,
+        address: Option<Address>,
+        previous: Vec<Address>,
+    }
+
+    /// What `prost` generates for `message Address { optional string city = 1; }`.
+    #[derive(Clone, PartialEq, Message)]
+    struct ProstAddress {
+        #[prost(string, optional, tag = "1")]
+        city: Option<String>,
+    }
+
+    /// What `prost` generates for:
+    ///
+    /// `message Customer { string name = 1; optional Address address = 2;
+    /// repeated Address previous = 3; }`
+    #[derive(Clone, PartialEq, Message)]
+    struct ProstCustomer {
+        #[prost(string, tag = "1")]
+        name: String,
+        /// Like `ToRow`, `prost` writes any `Some` message, even an empty one.
+        #[prost(message, optional, tag = "2")]
+        address: Option<ProstAddress>,
+        #[prost(message, repeated, tag = "3")]
+        previous: Vec<ProstAddress>,
+    }
+
+    /// An address with a city.
+    fn nyc() -> Address {
+        Address {
+            city: Some(CITY.to_string()),
+        }
+    }
+
+    #[test]
+    fn nested_structs_match_prost() -> anyhow::Result<()> {
+        let customer = Customer {
+            name: NAME.to_string(),
+            address: Some(nyc()),
+            previous: vec![nyc(), Address { city: None }],
+        };
+        let prost_nyc = ProstAddress {
+            city: Some(CITY.to_string()),
+        };
+        let want = ProstCustomer {
+            name: NAME.to_string(),
+            address: Some(prost_nyc.clone()),
+            previous: vec![prost_nyc, ProstAddress::default()],
+        };
+        assert_eq!(customer.to_row()?, want.encode_to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn nested_struct_by_hand() -> anyhow::Result<()> {
+        let customer = Customer {
+            name: NAME.to_string(),
+            address: Some(nyc()),
+            previous: vec![Address { city: None }],
+        };
+        let mut want = vec![0x0A, 0x05]; // name: tag (field 1, length-delimited), length 5
+        want.extend_from_slice(NAME.as_bytes());
+        // address: tag (field 2, length-delimited), then the length of the
+        // `Address` message. It has 5 bytes: the `city` field.
+        want.extend([0x12, 0x05]);
+        want.extend([0x0A, 0x03]); // city: tag (field 1, length-delimited), length 3
+        want.extend_from_slice(CITY.as_bytes());
+        // previous: tag (field 3, length-delimited), then an empty `Address`
+        // message. `city` is `None`, so the message has no fields.
+        want.extend([0x1A, 0x00]);
+        assert_eq!(customer.to_row()?, want);
+        Ok(())
+    }
+
+    #[test]
+    fn none_struct_is_left_out() -> anyhow::Result<()> {
+        let customer = Customer {
+            name: NAME.to_string(),
+            address: None,
+            previous: Vec::new(),
+        };
+        // Only `name` is written. BigQuery reads the missing `address` as a
+        // `NULL` struct, and the missing `previous` as an empty array.
+        let want = ProstCustomer {
+            name: NAME.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(customer.to_row()?, want.encode_to_vec());
+        Ok(())
+    }
+
+    /// What BigQuery receives for one field that holds a message, written by
+    /// hand.
+    fn sent_message_field(
+        name: &str,
+        number: u32,
+        type_name: &str,
+    ) -> anyhow::Result<prost_types::FieldDescriptorProto> {
+        use prost_types::field_descriptor_proto::Type;
+        Ok(prost_types::FieldDescriptorProto {
+            type_name: Some(type_name.to_string()),
+            ..sent_field(name, number, Type::Message)?
+        })
+    }
+
+    #[test]
+    fn nested_schema_matches_descriptor() -> anyhow::Result<()> {
+        use prost_types::field_descriptor_proto::{Label, Type};
+        let address = prost_types::DescriptorProto {
+            name: Some(ADDRESS.to_string()),
+            field: vec![sent_field(CITY_COLUMN, CITY_FIELD, Type::String)?],
+            ..Default::default()
+        };
+        let want = prost_types::DescriptorProto {
+            name: Some(CUSTOMER.to_string()),
+            field: vec![
+                sent_field(NAME_COLUMN, NAME_FIELD, Type::String)?,
+                sent_message_field(ADDRESS_COLUMN, ADDRESS_FIELD, ADDRESS)?,
+                prost_types::FieldDescriptorProto {
+                    label: Some(Label::Repeated as i32),
+                    ..sent_message_field(PREVIOUS_COLUMN, PREVIOUS_FIELD, ADDRESS)?
+                },
+            ],
+            // Both fields use the same `Address` type, declared once inside
+            // `Customer`. This keeps the schema self-contained.
+            nested_type: vec![address],
+            ..Default::default()
+        };
+        let got: v1::ProtoSchema = Customer::schema().to_proto()?;
+        assert_eq!(got.proto_descriptor, Some(want));
+        Ok(())
+    }
+
+    /// Returns the names of the types nested in `descriptor`.
+    fn nested_names(descriptor: &wkt::DescriptorProto) -> Vec<&str> {
+        descriptor
+            .nested_type
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect()
+    }
+
+    /// Returns the type names of the fields in `descriptor`. They are empty
+    /// for fields that do not hold messages.
+    fn field_type_names(descriptor: &wkt::DescriptorProto) -> Vec<&str> {
+        descriptor
+            .field
+            .iter()
+            .map(|f| f.type_name.as_str())
+            .collect()
+    }
+
+    /// The name of the message type for `Geo`.
+    const GEO: &str = "Geo";
+
+    /// The name of the message type for `Place`.
+    const PLACE: &str = "Place";
+
+    /// A struct for a `STRUCT<lat FLOAT64, lng FLOAT64>` column.
+    #[derive(ToRow)]
+    struct Geo {
+        lat: f64,
+        lng: f64,
+    }
+
+    /// A struct with a nested struct.
+    #[derive(ToRow)]
+    struct Place {
+        geo: Geo,
+    }
+
+    /// A row with two columns of the same `STRUCT` type.
+    #[derive(ToRow)]
+    struct Trip {
+        from: Place,
+        to: Place,
+    }
+
+    #[test]
+    fn nested_types_are_flattened() {
+        let descriptor = Trip::schema().proto_descriptor.expect("has a descriptor");
+        // `Geo` only appears inside `Place`, but it is declared in the row,
+        // next to `Place`. Each type is declared once.
+        assert_eq!(nested_names(&descriptor), [GEO, PLACE]);
+        assert_eq!(field_type_names(&descriptor), [PLACE, PLACE]);
+        // `Place` refers to `Geo` by its short name. Protobuf looks for it in
+        // `Place` first, and then in the enclosing message, the row.
+        assert_eq!(field_type_names(&descriptor.nested_type[1]), [GEO]);
+    }
+
+    /// The name of the message type for the first `Wrapper` type.
+    const WRAPPER: &str = "Wrapper";
+
+    /// The name of the message type for the second `Wrapper` type.
+    const WRAPPER_2: &str = "Wrapper_2";
+
+    /// A struct with a field of any type.
+    #[derive(ToRow)]
+    struct Wrapper<T> {
+        value: T,
+    }
+
+    /// A row with columns that hold different `Wrapper` types.
+    #[derive(ToRow)]
+    struct Wrapped {
+        count: Wrapper<i64>,
+        name: Wrapper<String>,
+        total: Wrapper<i64>,
+    }
+
+    #[test]
+    fn same_names_get_suffixes() {
+        let descriptor = Wrapped::schema()
+            .proto_descriptor
+            .expect("has a descriptor");
+        // `Wrapper<i64>` and `Wrapper<String>` have different fields, so they
+        // need two message types, with different names. `total` reuses the
+        // type for `count`.
+        assert_eq!(nested_names(&descriptor), [WRAPPER, WRAPPER_2]);
+        assert_eq!(field_type_names(&descriptor), [WRAPPER, WRAPPER_2, WRAPPER]);
+    }
+
+    /// The name of the message type for `Address`, when a column already has
+    /// the name `Address`.
+    const ADDRESS_2: &str = "Address_2";
+
+    /// A row with a column that has the same name as the type of the column.
+    #[derive(ToRow)]
+    struct Legacy {
+        #[bigquery(rename = "Address")]
+        home: Address,
+    }
+
+    #[test]
+    fn column_names_are_reserved() {
+        let descriptor = Legacy::schema().proto_descriptor.expect("has a descriptor");
+        // A message cannot have a field and a nested type with the same name,
+        // so the type for `Address` gets a suffix.
+        assert_eq!(nested_names(&descriptor), [ADDRESS_2]);
+        assert_eq!(field_type_names(&descriptor), [ADDRESS_2]);
+    }
+
+    /// A struct with one field, to nest structs many levels deep.
+    #[derive(ToRow)]
+    struct Nest<T> {
+        inner: T,
+    }
+
+    /// A field of this type nests 3 levels of `STRUCT` columns.
+    type Nest3<T> = Nest<Nest<Nest<T>>>;
+
+    /// A field of this type nests 15 levels of `STRUCT` columns, the most that
+    /// BigQuery supports.
+    type Nest15 = Nest3<Nest3<Nest3<Nest3<Nest3<i64>>>>>;
+
+    #[test]
+    fn fifteen_levels_are_supported() {
+        // A row with a field of type `Nest15`. The row is not a level.
+        let descriptor = Nest::<Nest15>::schema()
+            .proto_descriptor
+            .expect("has a descriptor");
+        // Each level has a different type, so each level needs a message type.
+        assert_eq!(descriptor.nested_type.len(), MAX_DEPTH);
+    }
+
+    #[test]
+    #[should_panic(expected = "is nested more than 15 levels deep")]
+    fn sixteen_levels_panic() {
+        let _ = Nest::<Nest<Nest15>>::schema();
+    }
+
+    /// A struct that contains itself. BigQuery schemas cannot do that.
+    #[derive(ToRow)]
+    struct Node {
+        name: String,
+        children: Vec<Node>,
+    }
+
+    #[test]
+    #[should_panic(expected = "contains itself")]
+    fn recursive_structs_panic() {
+        let _ = Node::schema();
+    }
+
+    /// A sample start for a range: 2025-05-16, which is 20,224 days after the
+    /// epoch.
+    fn check_in() -> Date {
+        date(2025, 5, 16)
+    }
+
+    /// `check_in()` in days since the epoch.
+    const CHECK_IN_DAYS: i64 = 20_224;
+
+    /// A sample end for a range: 2025-05-18, which is 20,226 days after the
+    /// epoch.
+    fn check_out() -> Date {
+        date(2025, 5, 18)
+    }
+
+    /// `check_out()` in days since the epoch.
+    const CHECK_OUT_DAYS: i64 = 20_226;
+
+    #[test]
+    fn range_by_hand() -> anyhow::Result<()> {
+        let stay: Range<Date> = Range::new().set_start(check_in()).set_end(check_out());
+        let want = [
+            0x0A, 0x08, // tag (field 1, length-delimited), then 8 bytes of fields
+            0x08, 0x80, 0x9E, 0x01, // start: tag (field 1, varint), 20224
+            0x10, 0x82, 0x9E, 0x01, // end: tag (field 2, varint), 20226
+        ];
+        assert_eq!(field_bytes(&stay)?, want);
+        Ok(())
+    }
+
+    /// What `prost` generates for:
+    ///
+    /// `message Range { optional int64 start = 1; optional int64 end = 2; }`
+    #[derive(Clone, PartialEq, Message)]
+    struct ProstRange {
+        #[prost(int64, optional, tag = "1")]
+        start: Option<i64>,
+        #[prost(int64, optional, tag = "2")]
+        end: Option<i64>,
+    }
+
+    /// Returns the fields of `message`, without a tag or a length.
+    fn message_bytes<T: ProtoMessage>(message: &T) -> Result<Vec<u8>, ConvertError> {
+        let mut buf = Vec::new();
+        message.encode_fields(&mut buf)?;
+        Ok(buf)
+    }
+
+    #[test_case(true, true; "bounded")]
+    #[test_case(false, true; "unbounded start")]
+    #[test_case(true, false; "unbounded end")]
+    #[test_case(false, false; "unbounded")]
+    fn range_matches_prost(has_start: bool, has_end: bool) -> anyhow::Result<()> {
+        let range: Range<Date> = Range::new()
+            .set_or_clear_start(has_start.then(check_in))
+            .set_or_clear_end(has_end.then(check_out));
+        // A missing `start` or `end` field is unbounded.
+        let want = ProstRange {
+            start: has_start.then_some(CHECK_IN_DAYS),
+            end: has_end.then_some(CHECK_OUT_DAYS),
+        };
+        assert_eq!(message_bytes(&range)?, want.encode_to_vec());
+        Ok(())
+    }
+
+    /// The name of the first message type for `RANGE` values.
+    const RANGE: &str = "Range";
+
+    /// The name of the second message type for `RANGE` values.
+    const RANGE_2: &str = "Range_2";
+
+    /// The name of the field for the start of a `RANGE` value.
+    const START_COLUMN: &str = "start";
+
+    /// The field number of `start`.
+    const START_FIELD: u32 = 1;
+
+    /// The name of the field for the end of a `RANGE` value.
+    const END_COLUMN: &str = "end";
+
+    /// The field number of `end`.
+    const END_FIELD: u32 = 2;
+
+    /// A row with a `RANGE` column for each element type.
+    #[derive(ToRow)]
+    struct Ranges {
+        dates: Range<Date>,
+        timestamps: Range<Timestamp>,
+        datetimes: Range<DateTime>,
+    }
+
+    /// What BigQuery receives for a `RANGE` message type, written by hand.
+    fn sent_range(
+        name: &str,
+        field_type: prost_types::field_descriptor_proto::Type,
+    ) -> anyhow::Result<prost_types::DescriptorProto> {
+        Ok(prost_types::DescriptorProto {
+            name: Some(name.to_string()),
+            field: vec![
+                sent_field(START_COLUMN, START_FIELD, field_type)?,
+                sent_field(END_COLUMN, END_FIELD, field_type)?,
+            ],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn range_schema_matches_descriptor() -> anyhow::Result<()> {
+        use prost_types::field_descriptor_proto::Type;
+        let descriptor = Ranges::schema().proto_descriptor.expect("has a descriptor");
+        assert_eq!(field_type_names(&descriptor), [RANGE, RANGE, RANGE_2]);
+        // `DATE` and `TIMESTAMP` values are both `int64` fields, so their
+        // ranges share one message type. `DATETIME` values are `string`
+        // fields, so their ranges need another one.
+        let got: v1::ProtoSchema = Ranges::schema().to_proto()?;
+        let want = vec![
+            sent_range(RANGE, Type::Int64)?,
+            sent_range(RANGE_2, Type::String)?,
+        ];
+        assert_eq!(got.proto_descriptor.map(|d| d.nested_type), Some(want));
         Ok(())
     }
 }
