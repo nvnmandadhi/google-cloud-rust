@@ -89,6 +89,8 @@ pub async fn run_proto_writes() -> Result<()> {
         proto::basic(&fixture).await?;
         proto::scalars(&fixture).await?;
         proto::json(&fixture).await?;
+        proto::intervals(&fixture).await?;
+        proto::geography(&fixture).await?;
         proto::nulls(&fixture).await?;
         proto::arrays(&fixture).await?;
         proto::nested(&fixture).await?;

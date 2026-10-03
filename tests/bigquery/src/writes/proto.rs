@@ -21,7 +21,7 @@ use anyhow::Result;
 use bigquery_samples::INSTANCE_LABEL;
 use bytes::Bytes;
 use google_cloud_bigquery::client::{BigQuery, Write};
-use google_cloud_bigquery::datatypes::Range;
+use google_cloud_bigquery::datatypes::{Interval, Range};
 use google_cloud_bigquery::error::RowError;
 use google_cloud_bigquery::model::ProtoRows;
 use google_cloud_bigquery::query::{FromRow, FromSql, Row};
@@ -43,7 +43,9 @@ const BYTES: &str = "BYTES";
 const DATE: &str = "DATE";
 const DATETIME: &str = "DATETIME";
 const FLOAT: &str = "FLOAT";
+const GEOGRAPHY: &str = "GEOGRAPHY";
 const INTEGER: &str = "INTEGER";
+const INTERVAL: &str = "INTERVAL";
 const JSON: &str = "JSON";
 const NUMERIC: &str = "NUMERIC";
 const RANGE: &str = "RANGE";
@@ -413,6 +415,171 @@ pub async fn json(fixture: &Fixture) -> Result<()> {
             value: Some("null".to_string()),
         },
         JsonText { id: 4, value: None },
+    ];
+    assert_eq!(got, want);
+    Ok(())
+}
+
+/// The table for [intervals].
+const INTERVALS_TABLE: &str = "proto_intervals";
+
+/// The most years in a BigQuery `INTERVAL`, positive or negative.
+const MAX_INTERVAL_YEARS: i32 = 10_000;
+
+/// The most days in a BigQuery `INTERVAL`, positive or negative.
+const MAX_INTERVAL_DAYS: i32 = 3_660_000;
+
+/// The most hours in a BigQuery `INTERVAL`, positive or negative.
+const MAX_INTERVAL_HOURS: i32 = 87_840_000;
+
+/// A row with `INTERVAL` columns.
+#[derive(Clone, Debug, FromRow, PartialEq, ToRow)]
+struct Intervals {
+    id: i64,
+    interval: Interval,
+    intervals: Vec<Interval>,
+}
+
+/// Writes intervals with mixed signs, with microseconds, and at the limits of
+/// a BigQuery `INTERVAL`.
+pub async fn intervals(fixture: &Fixture) -> Result<()> {
+    fixture
+        .create_table(
+            INTERVALS_TABLE,
+            vec![
+                column(ID, INTEGER),
+                column("interval", INTERVAL),
+                repeated(column("intervals", INTERVAL)),
+            ],
+        )
+        .await?;
+
+    let typical = Intervals {
+        id: 1,
+        // `1-2 3 4:5:6.123456`
+        interval: Interval::new()
+            .set_years(1)
+            .set_months(2)
+            .set_days(3)
+            .set_hours(4)
+            .set_minutes(5)
+            .set_seconds(6)
+            .set_nanos(123_456 * NANOS_PER_MICRO),
+        intervals: vec![
+            // Each part has its own sign: `0-8 -20 17:0:0`.
+            Interval::new().set_months(8).set_days(-20).set_hours(17),
+            // Negative parts under a year and under an hour: `-0-2 0 -0:30:10`.
+            Interval::new()
+                .set_months(-2)
+                .set_minutes(-30)
+                .set_seconds(-10),
+        ],
+    };
+    let zero = Intervals {
+        id: 2,
+        interval: Interval::new(),
+        intervals: Vec::new(),
+    };
+    let longest = Intervals {
+        id: 3,
+        interval: Interval::new()
+            .set_years(MAX_INTERVAL_YEARS)
+            .set_days(MAX_INTERVAL_DAYS)
+            .set_hours(MAX_INTERVAL_HOURS),
+        intervals: vec![
+            Interval::new()
+                .set_years(-MAX_INTERVAL_YEARS)
+                .set_days(-MAX_INTERVAL_DAYS)
+                .set_hours(-MAX_INTERVAL_HOURS),
+        ],
+    };
+    // Fields that BigQuery combines, and nanoseconds that it does not keep.
+    let uncombined = Intervals {
+        id: 4,
+        interval: Interval::new()
+            .set_months(14)
+            .set_minutes(90)
+            .set_nanos(1_999),
+        intervals: Vec::new(),
+    };
+    fixture
+        .write(
+            INTERVALS_TABLE,
+            &[
+                typical.clone(),
+                zero.clone(),
+                longest.clone(),
+                uncombined.clone(),
+            ],
+        )
+        .await?;
+
+    let got: Vec<Intervals> = fixture.read(INTERVALS_TABLE).await?;
+    // 14 months are 1 year and 2 months, 90 minutes are 1 hour and 30
+    // minutes, and BigQuery keeps whole microseconds.
+    let combined = Intervals {
+        interval: Interval::new()
+            .set_years(1)
+            .set_months(2)
+            .set_hours(1)
+            .set_minutes(30)
+            .set_nanos(NANOS_PER_MICRO),
+        ..uncombined
+    };
+    assert_eq!(got, [typical, zero, longest, combined]);
+    Ok(())
+}
+
+/// The table for [geography].
+const GEOGRAPHY_TABLE: &str = "proto_geography";
+
+/// A row with a `GEOGRAPHY` column, written from text.
+#[derive(Debug, FromRow, PartialEq, ToRow)]
+struct Place {
+    id: i64,
+    location: Option<String>,
+}
+
+/// Writes `GEOGRAPHY` values in the WKT and GeoJSON formats, and a `NULL`.
+pub async fn geography(fixture: &Fixture) -> Result<()> {
+    fixture
+        .create_table(
+            GEOGRAPHY_TABLE,
+            vec![column(ID, INTEGER), column("location", GEOGRAPHY)],
+        )
+        .await?;
+
+    let rows = [
+        Place {
+            id: 1,
+            location: Some("POINT(1 2)".to_string()),
+        },
+        Place {
+            id: 2,
+            location: Some(r#"{"type": "Point", "coordinates": [3, 4]}"#.to_string()),
+        },
+        Place {
+            id: 3,
+            location: None,
+        },
+    ];
+    fixture.write(GEOGRAPHY_TABLE, &rows).await?;
+
+    let got: Vec<Place> = fixture.read(GEOGRAPHY_TABLE).await?;
+    // BigQuery returns `GEOGRAPHY` values in the WKT format.
+    let want = [
+        Place {
+            id: 1,
+            location: Some("POINT(1 2)".to_string()),
+        },
+        Place {
+            id: 2,
+            location: Some("POINT(3 4)".to_string()),
+        },
+        Place {
+            id: 3,
+            location: None,
+        },
     ];
     assert_eq!(got, want);
     Ok(())
