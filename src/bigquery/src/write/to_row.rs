@@ -67,10 +67,12 @@ use wkt::{DescriptorProto, FieldDescriptorProto};
 ///   `Vec<u8>`, which is a `BYTES` value. Arrays cannot be `NULL` either:
 ///   `None` in an `Option<Vec<T>>` writes an empty array.
 /// - A [`Range<T>`](crate::datatypes::Range) without a `start` or an `end` is
-///   unbounded on that side. BigQuery rejects ranges where the start is not
-///   before the end.
-/// - BigQuery supports at most 15 levels of nested `STRUCT` columns. Structs
-///   cannot contain themselves, not even in a `Vec<T>`.
+///   unbounded on that side. When it has both, the start must be before the
+///   end, after rounding down any nanoseconds. [to_row](ToRow::to_row) returns
+///   an error for other ranges, which BigQuery SQL cannot create either.
+/// - Structs can be nested at most 14 levels deep. BigQuery limits the depth
+///   of a schema to 15, and the innermost field counts too. Structs cannot
+///   contain themselves, not even in a `Vec<T>`.
 ///
 /// # Example
 ///
@@ -157,7 +159,7 @@ pub trait ToRow {
     /// # Panics
     ///
     /// The implementation from `#[derive(ToRow)]` panics if structs are nested
-    /// more than 15 levels deep, or if a struct contains itself. Both depend
+    /// more than 14 levels deep, or if a struct contains itself. Both depend
     /// only on the types, not on any values, so any test that calls this
     /// function finds them.
     ///
@@ -363,10 +365,15 @@ impl ProtoValue for google_cloud_type::model::Date {
     }
 
     fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
-        let date = civil_date(self.year, self.month, self.day)?;
-        encode_int64(number, (date - UNIX_EPOCH).whole_days(), buf);
+        encode_int64(number, date_days(self)?, buf);
         Ok(())
     }
+}
+
+/// Returns the days since the Unix epoch, for a BigQuery `DATE` value.
+fn date_days(value: &google_cloud_type::model::Date) -> Result<i64, ConvertError> {
+    let date = civil_date(value.year, value.month, value.day)?;
+    Ok((date - UNIX_EPOCH).whole_days())
 }
 
 impl ProtoValue for google_cloud_type::model::DateTime {
@@ -377,19 +384,23 @@ impl ProtoValue for google_cloud_type::model::DateTime {
     }
 
     fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
-        if self.time_offset.is_some() {
-            return Err(ConvertError::Convert(
-                "a `DATETIME` has no time zone or UTC offset, use a `Timestamp` instead".into(),
-            ));
-        }
-        let date = civil_date(self.year, self.month, self.day)?;
-        let time = civil_time(self.hours, self.minutes, self.seconds, self.nanos)?;
-        let value = time::PrimitiveDateTime::new(date, time)
-            .format(DATETIME_FORMAT)
-            .map_err(|e| ConvertError::Convert(Box::new(e)))?;
-        encode_string(number, &value, buf);
+        encode_string(number, &datetime_string(self)?, buf);
         Ok(())
     }
+}
+
+/// Returns the string for a BigQuery `DATETIME` value.
+fn datetime_string(value: &google_cloud_type::model::DateTime) -> Result<String, ConvertError> {
+    if value.time_offset.is_some() {
+        return Err(ConvertError::Convert(
+            "a `DATETIME` has no time zone or UTC offset, use a `Timestamp` instead".into(),
+        ));
+    }
+    let date = civil_date(value.year, value.month, value.day)?;
+    let time = civil_time(value.hours, value.minutes, value.seconds, value.nanos)?;
+    time::PrimitiveDateTime::new(date, time)
+        .format(DATETIME_FORMAT)
+        .map_err(|e| ConvertError::Convert(Box::new(e)))
 }
 
 impl ProtoValue for google_cloud_type::model::TimeOfDay {
@@ -583,9 +594,55 @@ const RANGE_END: &str = "end";
 /// The field number of `end`.
 const RANGE_END_FIELD: u32 = 2;
 
+/// A type for the bounds of a [Range].
+///
+/// BigQuery SQL cannot create a range unless its start is before its end, so
+/// [ToRow::to_row] returns an error for other ranges. It compares the values
+/// that BigQuery receives, which keep microseconds, not nanoseconds.
+///
+/// [RangeElement] requires this trait, so code that is generic over the element
+/// type, such as a struct with `#[derive(ToRow)]`, can write ranges.
+///
+/// This is an implementation detail of [ToRow], it is not part of the public
+/// API.
+pub trait RangeBound {
+    /// The value that BigQuery receives for a bound. The values sort in the
+    /// same order as the bounds.
+    type Key: Ord;
+
+    /// Returns the value that BigQuery receives for this bound.
+    fn range_key(&self) -> Result<Self::Key, ConvertError>;
+}
+
+impl RangeBound for wkt::Timestamp {
+    type Key = i64;
+
+    fn range_key(&self) -> Result<i64, ConvertError> {
+        Ok(timestamp_micros(self))
+    }
+}
+
+impl RangeBound for google_cloud_type::model::Date {
+    type Key = i64;
+
+    fn range_key(&self) -> Result<i64, ConvertError> {
+        date_days(self)
+    }
+}
+
+impl RangeBound for google_cloud_type::model::DateTime {
+    // The strings have the same length, with the largest units first, so they
+    // sort in the same order as the values.
+    type Key = String;
+
+    fn range_key(&self) -> Result<String, ConvertError> {
+        datetime_string(self)
+    }
+}
+
 // BigQuery takes `RANGE<T>` values as a message with two fields, `start` and
 // `end`, of the type for `T`.
-impl<T: RangeElement + ProtoValue> ProtoMessage for Range<T> {
+impl<T: RangeElement + ProtoValue + RangeBound> ProtoMessage for Range<T> {
     const NAME: &'static str = RANGE_MESSAGE;
     const COLUMNS: &'static [&'static str] = &[RANGE_START, RANGE_END];
 
@@ -597,13 +654,20 @@ impl<T: RangeElement + ProtoValue> ProtoMessage for Range<T> {
     }
 
     fn encode_fields(&self, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
+        if let (Some(start), Some(end)) = (&self.start, &self.end)
+            && start.range_key()? >= end.range_key()?
+        {
+            return Err(ConvertError::Convert(
+                "the start of a `RANGE` must be before its end".into(),
+            ));
+        }
         // `None` leaves the field out, which BigQuery reads as unbounded.
         self.start.encode(RANGE_START_FIELD, buf)?;
         self.end.encode(RANGE_END_FIELD, buf)
     }
 }
 
-impl<T: RangeElement + ProtoValue> ProtoValue for Range<T> {
+impl<T: RangeElement + ProtoValue + RangeBound> ProtoValue for Range<T> {
     fn field_descriptor(name: &str, number: u32, types: &mut NestedTypes) -> FieldDescriptorProto {
         // A `RANGE` column is not a `STRUCT` column, so it does not count
         // toward the limit on nested `STRUCT` columns.
@@ -615,10 +679,14 @@ impl<T: RangeElement + ProtoValue> ProtoValue for Range<T> {
     }
 }
 
-impl<T: RangeElement + ProtoValue> ProtoElement for Range<T> {}
+impl<T: RangeElement + ProtoValue + RangeBound> ProtoElement for Range<T> {}
 
-/// BigQuery supports at most 15 levels of nested `STRUCT` columns.
-const MAX_DEPTH: usize = 15;
+/// The most levels of nested `STRUCT` columns that BigQuery supports.
+///
+/// BigQuery limits the depth of a schema to 15, and counts every part of a
+/// field path, such as `a.b.c`. The innermost field is not a `STRUCT`, so at
+/// most 14 parts can be.
+const MAX_DEPTH: usize = 14;
 
 /// The suffix for the second message type with the same name, as in
 /// `Address_2`.
@@ -747,7 +815,7 @@ pub fn encode_row<T: ProtoMessage>(row: &T) -> Result<Bytes, ConvertError> {
 ///
 /// # Panics
 ///
-/// If `T` is nested more than 15 levels deep, which includes any struct that
+/// If `T` is nested more than 14 levels deep, which includes any struct that
 /// contains itself.
 pub fn struct_field_descriptor<T: ProtoMessage>(
     name: &str,
@@ -778,7 +846,7 @@ pub fn encode_message<T: ProtoMessage>(
 #[cfg(test)]
 mod tests {
     use super::{MAX_DEPTH, NestedTypes, ProtoMessage, ProtoValue, timestamp_micros};
-    use crate::datatypes::Range;
+    use crate::datatypes::{Range, RangeElement};
     use crate::error::ConvertError;
     use crate::google::cloud::bigquery::storage::v1;
     use crate::write::ToRow;
@@ -1739,14 +1807,14 @@ mod tests {
     /// A field of this type nests 3 levels of `STRUCT` columns.
     type Nest3<T> = Nest<Nest<Nest<T>>>;
 
-    /// A field of this type nests 15 levels of `STRUCT` columns, the most that
+    /// A field of this type nests 14 levels of `STRUCT` columns, the most that
     /// BigQuery supports.
-    type Nest15 = Nest3<Nest3<Nest3<Nest3<Nest3<i64>>>>>;
+    type Nest14 = Nest<Nest<Nest3<Nest3<Nest3<Nest3<i64>>>>>>;
 
     #[test]
-    fn fifteen_levels_are_supported() {
-        // A row with a field of type `Nest15`. The row is not a level.
-        let descriptor = Nest::<Nest15>::schema()
+    fn fourteen_levels_are_supported() {
+        // A row with a field of type `Nest14`. The row is not a level.
+        let descriptor = Nest::<Nest14>::schema()
             .proto_descriptor
             .expect("has a descriptor");
         // Each level has a different type, so each level needs a message type.
@@ -1754,9 +1822,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "is nested more than 15 levels deep")]
-    fn sixteen_levels_panic() {
-        let _ = Nest::<Nest<Nest15>>::schema();
+    #[should_panic(expected = "is nested more than 14 levels deep")]
+    fn fifteen_levels_panic() {
+        let _ = Nest::<Nest<Nest14>>::schema();
     }
 
     /// A struct that contains itself. BigQuery schemas cannot do that.
@@ -1837,6 +1905,56 @@ mod tests {
         Ok(())
     }
 
+    /// Returns the fields of a range from `start` to `end`.
+    fn bounded_range_bytes<T: RangeElement>(start: T, end: T) -> Result<Vec<u8>, ConvertError>
+    where
+        Range<T>: ProtoMessage,
+    {
+        let range: Range<T> = Range::new().set_start(start).set_end(end);
+        message_bytes(&range)
+    }
+
+    #[test_case(check_in(), check_in(); "empty")]
+    #[test_case(check_out(), check_in(); "start after end")]
+    fn invalid_date_ranges_are_errors(start: Date, end: Date) {
+        let got = bounded_range_bytes(start, end);
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    // BigQuery keeps microseconds, so bounds that differ only in the last three
+    // digits of the nanoseconds are the same.
+    #[test_case(1_000, 1_000; "empty")]
+    #[test_case(1_000, 1_999; "same microsecond")]
+    #[test_case(2_000, 1_000; "start after end")]
+    fn invalid_timestamp_ranges_are_errors(start_nanos: i32, end_nanos: i32) -> anyhow::Result<()> {
+        let start = Timestamp::new(0, start_nanos)?;
+        let end = Timestamp::new(0, end_nanos)?;
+        let got = bounded_range_bytes(start, end);
+        assert!(got.is_err(), "{got:?}");
+        Ok(())
+    }
+
+    #[test_case(1_000, 1_000; "empty")]
+    #[test_case(1_000, 1_999; "same microsecond")]
+    #[test_case(2_000, 1_000; "start after end")]
+    fn invalid_datetime_ranges_are_errors(start_nanos: i32, end_nanos: i32) {
+        let start = datetime(check_in(), time_of_day(0, 0, 0, start_nanos));
+        let end = datetime(check_in(), time_of_day(0, 0, 0, end_nanos));
+        let got = bounded_range_bytes(start, end);
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    #[test]
+    fn range_bounds_compare_microseconds() -> anyhow::Result<()> {
+        // 999 nanoseconds round down to 0 microseconds, and 1,000 nanoseconds
+        // are 1 microsecond, so these ranges start before they end.
+        bounded_range_bytes(Timestamp::new(0, 999)?, Timestamp::new(0, 1_000)?)?;
+        let start = datetime(check_in(), time_of_day(0, 0, 0, 999));
+        let end = datetime(check_in(), time_of_day(0, 0, 0, 1_000));
+        bounded_range_bytes(start, end)?;
+        Ok(())
+    }
+
     /// The name of the first message type for `RANGE` values.
     const RANGE: &str = "Range";
 
@@ -1892,6 +2010,26 @@ mod tests {
             sent_range(RANGE_2, Type::String)?,
         ];
         assert_eq!(got.proto_descriptor.map(|d| d.nested_type), Some(want));
+        Ok(())
+    }
+
+    /// A row that is generic over the element type of its range.
+    #[derive(ToRow)]
+    struct Stay<T: RangeElement> {
+        period: Range<T>,
+    }
+
+    #[test]
+    fn to_row_rejects_invalid_ranges() -> anyhow::Result<()> {
+        let valid: Stay<Date> = Stay {
+            period: Range::new().set_start(check_in()).set_end(check_out()),
+        };
+        valid.to_row()?;
+        let invalid: Stay<Date> = Stay {
+            period: Range::new().set_start(check_out()).set_end(check_in()),
+        };
+        let got = invalid.to_row();
+        assert!(matches!(got, Err(ConvertError::Convert(_))), "{got:?}");
         Ok(())
     }
 }
