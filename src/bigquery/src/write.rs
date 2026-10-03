@@ -36,8 +36,11 @@ pub mod stream_type;
 /// removed, in any release.
 #[doc(hidden)]
 pub mod __private {
-    pub use super::to_row::{ProtoElement, ProtoValue, message_schema};
+    pub use super::to_row::{
+        NestedTypes, ProtoElement, ProtoMessage, ProtoValue, encode_row, message_schema,
+    };
     pub use bytes::Bytes;
+    pub use wkt::FieldDescriptorProto;
 }
 
 pub(super) mod append_future;

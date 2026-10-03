@@ -119,7 +119,9 @@ pub trait ToRow {
 )]
 pub trait ProtoValue {
     /// Describes a field of this type, with the given name and field number.
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto;
+    ///
+    /// Fields that hold messages add the message types to `types`.
+    fn field_descriptor(name: &str, number: u32, types: &mut NestedTypes) -> FieldDescriptorProto;
 
     /// Appends `self` to `buf`, as the field with the given number.
     ///
@@ -145,8 +147,26 @@ pub trait ProtoValue {
 )]
 pub trait ProtoElement: ProtoValue {}
 
+/// A Rust type that is written as a protobuf message, such as a row.
+///
+/// `#[derive(ToRow)]` implements this trait, and [ToRow] uses it to describe
+/// and encode rows.
+///
+/// This is an implementation detail of [ToRow], it is not part of the public
+/// API.
+pub trait ProtoMessage {
+    /// The name of the message.
+    const NAME: &'static str;
+
+    /// Describes the fields of the message.
+    fn fields(types: &mut NestedTypes) -> Vec<FieldDescriptorProto>;
+
+    /// Appends the fields of `self` to `buf`, in the protobuf wire format.
+    fn encode_fields(&self, buf: &mut Vec<u8>) -> Result<(), ConvertError>;
+}
+
 impl ProtoValue for String {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         string_field(name, number)
     }
 
@@ -157,7 +177,7 @@ impl ProtoValue for String {
 }
 
 impl ProtoValue for i64 {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         int64_field(name, number)
     }
 
@@ -168,7 +188,7 @@ impl ProtoValue for i64 {
 }
 
 impl ProtoValue for i32 {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // `INT64` columns also take `int32` fields, but the bytes would be the
         // same: protobuf sign-extends negative `int32` values to 64 bits.
         int64_field(name, number)
@@ -181,7 +201,7 @@ impl ProtoValue for i32 {
 }
 
 impl ProtoValue for bool {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         bool_field(name, number)
     }
 
@@ -192,7 +212,7 @@ impl ProtoValue for bool {
 }
 
 impl ProtoValue for f64 {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         double_field(name, number)
     }
 
@@ -203,7 +223,7 @@ impl ProtoValue for f64 {
 }
 
 impl ProtoValue for f32 {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // BigQuery converts `float` fields to `FLOAT64` values. They take 4
         // bytes instead of 8, which keeps rows smaller.
         float_field(name, number)
@@ -216,7 +236,7 @@ impl ProtoValue for f32 {
 }
 
 impl ProtoValue for Vec<u8> {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         bytes_field(name, number)
     }
 
@@ -227,7 +247,7 @@ impl ProtoValue for Vec<u8> {
 }
 
 impl ProtoValue for Bytes {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         bytes_field(name, number)
     }
 
@@ -238,7 +258,7 @@ impl ProtoValue for Bytes {
 }
 
 impl ProtoValue for wkt::Timestamp {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // BigQuery takes `TIMESTAMP` values as microseconds since the Unix
         // epoch, in an `int64` field.
         int64_field(name, number)
@@ -267,7 +287,7 @@ fn timestamp_micros(timestamp: &wkt::Timestamp) -> i64 {
 }
 
 impl ProtoValue for google_cloud_type::model::Date {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // BigQuery takes `DATE` values as days since the Unix epoch, in an
         // `int64` field.
         int64_field(name, number)
@@ -281,7 +301,7 @@ impl ProtoValue for google_cloud_type::model::Date {
 }
 
 impl ProtoValue for google_cloud_type::model::DateTime {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // BigQuery takes `DATETIME` values as strings, such as
         // "2025-05-16 09:46:12.123456".
         string_field(name, number)
@@ -304,7 +324,7 @@ impl ProtoValue for google_cloud_type::model::DateTime {
 }
 
 impl ProtoValue for google_cloud_type::model::TimeOfDay {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // BigQuery takes `TIME` values as strings, such as "09:46:12.123456".
         string_field(name, number)
     }
@@ -380,7 +400,7 @@ fn civil_time(
 }
 
 impl ProtoValue for rust_decimal::Decimal {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // BigQuery takes `NUMERIC` and `BIGNUMERIC` values as strings, such as
         // "123.45". Unlike a `double`, a string keeps every digit.
         string_field(name, number)
@@ -393,7 +413,7 @@ impl ProtoValue for rust_decimal::Decimal {
 }
 
 impl ProtoValue for google_cloud_type::model::Decimal {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // BigQuery takes `NUMERIC` and `BIGNUMERIC` values as strings.
         string_field(name, number)
     }
@@ -406,7 +426,7 @@ impl ProtoValue for google_cloud_type::model::Decimal {
 }
 
 impl ProtoValue for wkt::Value {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // BigQuery takes `JSON` values as strings.
         string_field(name, number)
     }
@@ -418,7 +438,7 @@ impl ProtoValue for wkt::Value {
 }
 
 impl ProtoValue for wkt::Struct {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, _: &mut NestedTypes) -> FieldDescriptorProto {
         // BigQuery takes `JSON` values as strings.
         string_field(name, number)
     }
@@ -431,9 +451,9 @@ impl ProtoValue for wkt::Struct {
 }
 
 impl<T: ProtoValue> ProtoValue for Option<T> {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
+    fn field_descriptor(name: &str, number: u32, types: &mut NestedTypes) -> FieldDescriptorProto {
         // All fields are optional in the schema, so `NULL` needs no changes.
-        T::field_descriptor(name, number)
+        T::field_descriptor(name, number, types)
     }
 
     fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
@@ -465,8 +485,8 @@ impl ProtoElement for wkt::Value {}
 impl ProtoElement for wkt::Struct {}
 
 impl<T: ProtoElement> ProtoValue for Vec<T> {
-    fn field_descriptor(name: &str, number: u32) -> FieldDescriptorProto {
-        repeated_field(T::field_descriptor(name, number))
+    fn field_descriptor(name: &str, number: u32, types: &mut NestedTypes) -> FieldDescriptorProto {
+        repeated_field(T::field_descriptor(name, number, types))
     }
 
     fn encode(&self, number: u32, buf: &mut Vec<u8>) -> Result<(), ConvertError> {
@@ -479,21 +499,53 @@ impl<T: ProtoElement> ProtoValue for Vec<T> {
     }
 }
 
-/// Returns the schema for a message with the given name and fields.
+/// The message types that a schema needs, besides the message for the row.
+///
+/// BigQuery needs a self-contained schema, so these types are nested in the
+/// message for the row.
 ///
 /// This is an implementation detail of [ToRow], it is not part of the public
 /// API.
-pub fn message_schema<I>(name: &str, fields: I) -> ProtoSchema
-where
-    I: IntoIterator<Item = FieldDescriptorProto>,
-{
-    let descriptor = DescriptorProto::new().set_name(name).set_field(fields);
+#[derive(Debug, Default)]
+pub struct NestedTypes {
+    /// The descriptors of the types, in the order they were added.
+    types: Vec<DescriptorProto>,
+}
+
+impl NestedTypes {
+    /// Returns the descriptors of the types, in the order they were added.
+    fn into_descriptors(self) -> Vec<DescriptorProto> {
+        self.types
+    }
+}
+
+/// Returns the schema for rows of type `T`.
+///
+/// This is an implementation detail of [ToRow], it is not part of the public
+/// API.
+pub fn message_schema<T: ProtoMessage>() -> ProtoSchema {
+    let mut types = NestedTypes::default();
+    let fields = T::fields(&mut types);
+    let descriptor = DescriptorProto::new()
+        .set_name(T::NAME)
+        .set_field(fields)
+        .set_nested_type(types.into_descriptors());
     ProtoSchema::new().set_proto_descriptor(descriptor)
+}
+
+/// Encodes `row` as one row, in the protobuf wire format.
+///
+/// This is an implementation detail of [ToRow], it is not part of the public
+/// API.
+pub fn encode_row<T: ProtoMessage>(row: &T) -> Result<Bytes, ConvertError> {
+    let mut buf = Vec::new();
+    row.encode_fields(&mut buf)?;
+    Ok(buf.into())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtoValue, timestamp_micros};
+    use super::{NestedTypes, ProtoValue, timestamp_micros};
     use crate::error::ConvertError;
     use crate::google::cloud::bigquery::storage::v1;
     use crate::write::ToRow;
@@ -739,7 +791,7 @@ mod tests {
     /// Returns the protobuf type of a field of type `T`. The name and number
     /// do not matter.
     fn field_type<T: ProtoValue>() -> wkt::field_descriptor_proto::Type {
-        T::field_descriptor(NAME_COLUMN, NAME_FIELD).r#type
+        T::field_descriptor(NAME_COLUMN, NAME_FIELD, &mut NestedTypes::default()).r#type
     }
 
     #[test]
@@ -773,7 +825,7 @@ mod tests {
     /// Returns the label of a field of type `T`. The name and number do not
     /// matter.
     fn field_label<T: ProtoValue>() -> wkt::field_descriptor_proto::Label {
-        T::field_descriptor(NAME_COLUMN, NAME_FIELD).label
+        T::field_descriptor(NAME_COLUMN, NAME_FIELD, &mut NestedTypes::default()).label
     }
 
     #[test]
