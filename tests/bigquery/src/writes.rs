@@ -87,6 +87,7 @@ pub async fn run_proto_writes() -> Result<()> {
     let result = async {
         let fixture = proto::Fixture::new(&project_id, &dataset_id).await?;
         proto::basic(&fixture).await?;
+        proto::datatypes(&fixture).await?;
         proto::scalars(&fixture).await?;
         proto::json(&fixture).await?;
         proto::intervals(&fixture).await?;

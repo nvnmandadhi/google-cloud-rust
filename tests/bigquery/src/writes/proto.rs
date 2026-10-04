@@ -227,6 +227,133 @@ pub async fn basic(fixture: &Fixture) -> Result<()> {
     Ok(())
 }
 
+/// The table for [datatypes].
+const DATATYPES_TABLE: &str = "proto_datatypes";
+
+/// 2026-05-28T15:30:00Z, in seconds since the Unix epoch.
+const MAY_28_2026_SECONDS: i64 = 1_779_982_200;
+
+/// A row with a column for each BigQuery data type.
+///
+/// Apart from `id`, the fields up to `json_val` have the same names, types,
+/// and values as `UserData` in `query.rs`, which `query_client_datatypes`
+/// reads with a query. The fields after it have the types that `UserData`
+/// doesn't: `NUMERIC`, `BIGNUMERIC`, `GEOGRAPHY`, `STRUCT`, and
+/// `RANGE<DATETIME>`.
+#[derive(Debug, FromRow, PartialEq, ToRow)]
+struct UserData {
+    id: i64,
+    name: String,
+    age: i64,
+    height: f64,
+    active: bool,
+    numbers: Vec<i64>,
+    created_at: wkt::Timestamp,
+    birth_date: Date,
+    daily_alarm: TimeOfDay,
+    event_time: DateTime,
+    date_range: Range<Date>,
+    timestamp_range: Range<wkt::Timestamp>,
+    nullable_name: Option<String>,
+    nullable_age: Option<i64>,
+    raw_bytes: Vec<u8>,
+    payload_bytes: Bytes,
+    nullable_bytes: Option<Vec<u8>>,
+    interval_val: Interval,
+    json_val: wkt::Struct,
+    balance: RustDecimal,
+    big_balance: Decimal,
+    location: String,
+    home: Address,
+    datetime_range: Range<DateTime>,
+}
+
+/// Writes a row with a column for each BigQuery data type, and reads it back.
+///
+/// This is the write side of `query_client_datatypes` in `query.rs`.
+pub async fn datatypes(fixture: &Fixture) -> Result<()> {
+    fixture
+        .create_table(
+            DATATYPES_TABLE,
+            vec![
+                column(ID, INTEGER),
+                column("name", STRING),
+                column("age", INTEGER),
+                column("height", FLOAT),
+                column("active", BOOLEAN),
+                repeated(column("numbers", INTEGER)),
+                column("created_at", TIMESTAMP),
+                column("birth_date", DATE),
+                column("daily_alarm", TIME),
+                column("event_time", DATETIME),
+                range("date_range", DATE),
+                range("timestamp_range", TIMESTAMP),
+                column("nullable_name", STRING),
+                column("nullable_age", INTEGER),
+                column("raw_bytes", BYTES),
+                column("payload_bytes", BYTES),
+                column("nullable_bytes", BYTES),
+                column("interval_val", INTERVAL),
+                column("json_val", JSON),
+                column("balance", NUMERIC),
+                column("big_balance", BIGNUMERIC),
+                column("location", GEOGRAPHY),
+                record("home", address_fields()),
+                range("datetime_range", DATETIME),
+            ],
+        )
+        .await?;
+
+    let birth_date = date(2026, 5, 28);
+    let next_day = date(2026, 5, 29);
+    let daily_alarm = time(15, 30, 0, 0);
+    let event_time = datetime(&birth_date, &daily_alarm);
+    let next_event = datetime(&next_day, &daily_alarm);
+    let created_at = wkt::Timestamp::new(MAY_28_2026_SECONDS, 0)?;
+    let rows = [UserData {
+        id: 1,
+        // The values that `query_client_datatypes` reads.
+        name: "John Doe".to_string(),
+        age: 30,
+        height: 1.85,
+        active: true,
+        numbers: vec![1, 2, 3],
+        created_at,
+        birth_date: birth_date.clone(),
+        daily_alarm,
+        event_time: event_time.clone(),
+        date_range: Range::new().set_start(birth_date).set_end(next_day),
+        timestamp_range: Range::new().set_start(created_at),
+        nullable_name: None,
+        nullable_age: None,
+        raw_bytes: b"hello world".to_vec(),
+        payload_bytes: Bytes::from_static(b"payload in bytes"),
+        nullable_bytes: None,
+        interval_val: Interval::new()
+            .set_days(1)
+            .set_hours(2)
+            .set_minutes(30)
+            .set_seconds(45)
+            .set_nanos(123_456 * NANOS_PER_MICRO),
+        json_val: object(json!({"role": "admin", "level": 5}))?,
+        // The types that `query_client_datatypes` doesn't read.
+        balance: "1234.56".parse()?,
+        // More digits before the decimal point than `NUMERIC` keeps.
+        big_balance: Decimal::new().set_value("123456789012345678901234567890.123456789"),
+        location: "POINT(-122 37)".to_string(),
+        home: Address {
+            city: Some("Mountain View".to_string()),
+            zip: Some("94043".to_string()),
+        },
+        datetime_range: Range::new().set_start(event_time).set_end(next_event),
+    }];
+    fixture.write(DATATYPES_TABLE, &rows).await?;
+
+    let got: Vec<UserData> = fixture.read(DATATYPES_TABLE).await?;
+    assert_eq!(got, rows);
+    Ok(())
+}
+
 /// The table for [scalars].
 const SCALARS_TABLE: &str = "proto_scalars";
 
